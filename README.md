@@ -8,12 +8,22 @@
  - 在`param.yaml`中定义一些可配置参数
    ```Shell
    display_mode: True
-   record_mode: True
+   record_mode: False
+   
    region_l1: 7
    region_l2: 3
    region_l3: 3
    region_l4: 3
    region_l5: 2
+   
+   max_width: 0.5
+   coordinate_offset_x: 0
+   coordinate_offset_y: 0
+   
+   sub_topic_image: /image_rectified
+   pub_topic_areasinfo: /sweeper/area_info
+   pub_topic_objects: /sweeper/obstacles
+   pub_topic_envinfo: /sweeper/env_info
    ```
 
 ## 启动
