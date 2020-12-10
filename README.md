@@ -57,5 +57,28 @@
    ```Shell
    rosparam set /record_mode False
    ```
+## 开机自启动
+ - 编写sh文件，例如`auto_start.sh`
+   ```Shell
+   #!/bin/bash
+   source /opt/ros/melodic/setup.bash
+   source /home/seucar/wendao/sweeper/ros_ws/devel/setup.bash
+   
+   roslaunch /home/seucar/wendao/sweeper/ros_ws/src/my_image_publisher/launch/img_publisher.launch camera_id:=1 &
+   sleep 5
+   roslaunch /home/seucar/wendao/sweeper/ros_ws/src/transmiter/launch/transmiter.launch &
+   sleep 5
 
+   #!/usr/bin/env python3
+   cd /home/seucar/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/
+   rosparam load param.yaml
+   python3 detection.py
+   sleep 5
+   ```
+ - 终端执行命令
+   ```Shell
+   gnome-session-properties
+   ```
+ - 添加新的启动程序，并指向所编写的sh文件
+ 
 
