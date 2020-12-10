@@ -13,5 +13,5 @@ sleep 5
 
 cd /home/seucar/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/
 rosparam load param.yaml
-python3 detection_v6.py
+python3 detection_v7.py
 sleep 5
