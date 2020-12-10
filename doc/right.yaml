@@ -1,0 +1,17 @@
+%YAML:1.0
+---
+CameraMat: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [946.1542406257707, 0, 327.65104340184, 0, 948.2274416148002, 173.2520814027691, 0, 0, 1]
+DistCoeff: !!opencv-matrix
+   rows: 5
+   cols: 1
+   dt: d
+   data: [-0.029931126115536, -0.07486926320488743, -0.006266699285807578, 0.0007781471444165426, 0]
+ImageSize: [640, 480]
+Reprojection Error: 0.0
+DistModel: plumb_bob
+Height: 1.75
+Theta: 1.25
