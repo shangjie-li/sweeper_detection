@@ -36,7 +36,7 @@
 """
 
 # For computer seucar.
-seucar_switch = True
+seucar_switch = False
 
 # For set /display_mode dynamically.
 display_switch = False
