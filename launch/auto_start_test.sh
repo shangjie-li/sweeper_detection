@@ -7,4 +7,4 @@ source ~/wendao/sweeper/ros_ws/devel/setup.bash
 
 cd ~/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/
 rosparam load param.yaml
-python3 detection_v8.py
+python3 detection_dual.py
