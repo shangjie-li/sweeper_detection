@@ -36,7 +36,7 @@
 """
 
 # For computer seucar.
-seucar_switch = False
+seucar_switch = True
 
 # For set /display_mode dynamically.
 display_switch = False
@@ -489,6 +489,11 @@ def image_callback(image_data):
     for region_i in range(8):
         region_output[region_i, 3] = region_i + 1
     
+    # 初始化变量
+    rubbsih_num = 0
+    vegetation_num = 0
+    person_num = 0
+    
     with torch.no_grad():
         # 目标检测
         frame = torch.from_numpy(cv_image).cuda().float()
@@ -871,6 +876,7 @@ def image_callback(image_data):
     if display_switch:
         print('region_output')
         print(region_output)
+        cv2.namedWindow("result_image",0)
         cv2.imshow("raw_image", cv_image)
         cv2.imshow("result_image", result_image)
         if cv2.waitKey(1) == 27:
