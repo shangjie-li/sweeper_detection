@@ -25,14 +25,17 @@
     2.增加对行人目标检测结果后处理过程
     3.优化检测结果的显示界面
 修改注释(20201205)：
-    1.调整各类别置信度阈值
-    2.根据config.py修改相关变量名
+    1.更新权重文件yolact_resnet50_20201106_1.pth
+    2.调整各类别置信度阈值
+    3.根据config.py修改相关变量名
 修改注释(20201207)：
     1.在param.yaml文件中增加订阅话题名、发布话题名及其他参数
     2.增加输出消息areasinfo_msg
     3.增加输出消息objects_msg
     4.增加输出消息envinfo_msg
     5.修改目标检测结果后处理中的部分内容
+    6.修改行人目标的定位策略
+    7.优化检测结果的显示界面
 """
 
 # For computer seucar.
@@ -797,8 +800,10 @@ def image_callback(image_data):
                 
                 # 遍历每个目标
                 for i in range(person_boundary_pts.shape[0]):
-                    effective_pt_num = 0
-                    b_area_id = []
+                    effective_pt = False
+                    effective_area_id = 0
+                    effective_pt_u = 0
+                    effective_pt_v = 0
                     # 统计有效点数量，计算每个有效点的世界坐标和所在区域
                     for b_pt in range(person_boundary_pts.shape[1]):
                         b_pt_u = person_boundary_pts[i, b_pt, 0, 0]
@@ -808,14 +813,15 @@ def image_callback(image_data):
                             loc_b_pt = p2d_table[b_pt_u, b_pt_v]
                             # 排除世界坐标无效点(x=0,z=0)
                             if loc_b_pt[0] or loc_b_pt[1]:
-                                effective_pt_num += 1
-                                b_area_id.append(CameraT.whatArea(loc_b_pt[0], loc_b_pt[1]))
+                                loc_area_id = CameraT.whatArea(loc_b_pt[0], loc_b_pt[1])
+                                # 排除区域ID无效点(ID=0)，且只考虑边界点中处于图像最下方的点，即行人所在位置
+                                if loc_area_id and b_pt_v > effective_pt_v:
+                                    effective_pt = True
+                                    effective_area_id = loc_area_id
                     
-                    # 更新各区域内行人标志位
-                    for b_pt in range(effective_pt_num):
-                        # 排除区域ID无效点(ID=0)
-                        if b_area_id[b_pt]:
-                            region_person_type[b_area_id[b_pt] - 1, 0] = 1
+                    # 更新行人所在区域的标志位
+                    if effective_pt:
+                        region_person_type[effective_area_id - 1, 0] = 1
                 
                 # 界定有无行人
                 for region_i in range(8):
