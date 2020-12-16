@@ -35,6 +35,8 @@
     5.修改目标检测结果后处理中的部分内容
     6.修改行人目标的定位策略
     7.优化检测结果的显示界面
+修改注释_v8(20201216)：
+    1.
 """
 
 # For computer seucar.
@@ -83,13 +85,13 @@ from pathlib import Path
 from collections import OrderedDict
 import matplotlib.pyplot as plt
 
-from data import COLORS
-from yolact import Yolact
-from utils.augmentations import FastBaseTransform
-from utils import timer
-from utils.functions import SavePath
-from layers.output_utils import postprocess
-from data import cfg, set_cfg
+from data_custom import COLORS
+from yolact_custom import Yolact_custom
+from utils_custom.augmentations_custom import FastBaseTransform_custom
+from utils_custom import timer
+from utils_custom.functions import SavePath
+from layers_custom.output_utils_custom import postprocess_custom
+from data_custom import cfg_custom, set_cfg_custom
 
 if seucar_switch:
     sys.path.append('/home/seucar/wendao/sweeper/region_divide')
@@ -112,11 +114,11 @@ def parse_args(argv=None):
     # Added by shangjie 20200801.
     if seucar_switch:
         parser.add_argument('--trained_model',
-                            default='/home/seucar/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_20201106_1.pth', type=str,
+                            default='/home/seucar/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_20201105_1.pth', type=str,
                             help='Trained state_dict file path to open. If "interrupt", this will open the interrupt file.')
     else:
         parser.add_argument('--trained_model',
-                            default='/home/lishangjie/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_20201106_1.pth', type=str,
+                            default='/home/lishangjie/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_20201105_1.pth', type=str,
                             help='Trained state_dict file path to open. If "interrupt", this will open the interrupt file.')
     
     parser.add_argument('--top_k', default=30, type=int,
@@ -225,7 +227,7 @@ def result_display(img, masks, classes, scores, boxes, num_target):
     # First, draw the masks on the GPU where we can do it really fast
     # Beware: very fast but possibly unintelligible mask-drawing code ahead
     # I wish I had access to OpenGL or Vulkan but alas, I guess Pytorch tensor operations will have to suffice
-    if args.display_masks and cfg.eval_mask_branch and num_target > 0:
+    if args.display_masks and cfg_custom.eval_mask_branch and num_target > 0:
         # After this, mask is of size [num_dets, h, w, 1]
         masks = masks[:, :, :, None]
 
@@ -264,7 +266,7 @@ def result_display(img, masks, classes, scores, boxes, num_target):
         # 显示检测结果
         score = scores[i]
         cv2.rectangle(img_numpy, (x1, y1), (x2, y2), color, 1)
-        _class = cfg.dataset.class_names[classes[i]]
+        _class = cfg_custom.dataset.class_names[classes[i]]
         text_str = '%s: %.2f' % (_class, score) if args.display_scores else _class
         text_w, text_h = cv2.getTextSize(text_str, font_face, font_scale, font_thickness)[0]
         cv2.rectangle(img_numpy, (x1, y1), (x1 + text_w, y1 - text_h - 4), color, -1)
@@ -315,7 +317,7 @@ def get_boundary(img_numpy, num_target, masks, cpt_num=10):
             contours_cpts = contours_array[cpts, :, :]
             # cv2.drawContours的输入参数包括image, contours, contourIdx, color, thickness
             # 参数contourIdx为-1时绘制contours中的所有轮廓
-            cv2.drawContours(img_numpy, contours_cpts, -1, (0, 0, 255), 3)
+            cv2.drawContours(img_numpy, contours_cpts, -1, (0, 0, 255), 2)
             for c_cpt in range(contours_cpts.shape[0]):
                 boundary_pts[i, c_cpt, 0, :] = contours_cpts[c_cpt, 0, :]
         
@@ -498,7 +500,7 @@ def image_callback(image_data):
     with torch.no_grad():
         # 目标检测
         frame = torch.from_numpy(cv_image).cuda().float()
-        batch = FastBaseTransform()(frame.unsqueeze(0))
+        batch = FastBaseTransform_custom()(frame.unsqueeze(0))
         preds = net(batch)
         
         # 针对不同目标类别设置不同top_k
@@ -522,17 +524,17 @@ def image_callback(image_data):
         
         # 建立每个目标的蒙版target_masks、类别target_classes、置信度target_scores、边界框target_boxes的一一对应关系
         h, w, _ = frame.shape
-        with timer.env('Postprocess'):
-            save = cfg.rescore_bbox
-            cfg.rescore_bbox = True
+        with timer.env('Postprocess_custom'):
+            save = cfg_custom.rescore_bbox
+            cfg_custom.rescore_bbox = True
             # 检测结果
-            t = postprocess(preds, w, h, visualize_lincomb = args.display_lincomb,
+            t = postprocess_custom(preds, w, h, visualize_lincomb = args.display_lincomb,
                                          crop_masks        = args.crop,
                                          score_threshold   = min_score_threshold)
-            cfg.rescore_bbox = save
+            cfg_custom.rescore_bbox = save
         with timer.env('Copy'):
             idx = t[1].argsort(0, descending=True)[:total_top_k]
-            if cfg.eval_mask_branch:
+            if cfg_custom.eval_mask_branch:
                 # Masks are drawn on the GPU, so don't copy
                 masks = t[3][idx]
             classes, scores, boxes = [x[idx].cpu().numpy() for x in t[:3]]
@@ -552,27 +554,27 @@ def image_callback(image_data):
         num_person = 0
         num_other = 0
         for j in range(classes.shape[0]):
-            if cfg.dataset.class_names[classes[j]] in rubbish_items_1:
+            if cfg_custom.dataset.class_names[classes[j]] in rubbish_items_1:
                 if num_rubbish < rubbish_top_k and scores[j] > rubbish_score_threshold_1:
                     remain_list.append(j)
                     num_rubbish += 1
-            elif cfg.dataset.class_names[classes[j]] in rubbish_items_2:
+            elif cfg_custom.dataset.class_names[classes[j]] in rubbish_items_2:
                 if num_rubbish < rubbish_top_k and scores[j] > rubbish_score_threshold_2:
                     remain_list.append(j)
                     num_rubbish += 1
-            elif cfg.dataset.class_names[classes[j]] in rubbish_items_3:
+            elif cfg_custom.dataset.class_names[classes[j]] in rubbish_items_3:
                 if num_rubbish < rubbish_top_k and scores[j] > rubbish_score_threshold_3:
                     remain_list.append(j)
                     num_rubbish += 1
-            elif cfg.dataset.class_names[classes[j]] in vegetation_items:
+            elif cfg_custom.dataset.class_names[classes[j]] in vegetation_items:
                 if num_vegetation < vegetation_top_k and scores[j] > vegetation_score_threshold:
                     remain_list.append(j)
                     num_vegetation += 1
-            elif cfg.dataset.class_names[classes[j]] in person_items:
+            elif cfg_custom.dataset.class_names[classes[j]] in person_items:
                 if num_person < person_top_k and scores[j] > person_score_threshold:
                     remain_list.append(j)
                     num_person += 1
-            elif cfg.dataset.class_names[classes[j]] in other_items:
+            elif cfg_custom.dataset.class_names[classes[j]] in other_items:
                 if num_other < other_top_k and scores[j] > other_score_threshold:
                     remain_list.append(j)
                     num_other += 1
@@ -602,11 +604,11 @@ def image_callback(image_data):
             vegetation_items = ['grass', 'shrub', 'flower']
             person_items = ['person']
             while check_k < target_classes.shape[0]:
-                if cfg.dataset.class_names[target_classes[check_k]] in rubbish_items:
+                if cfg_custom.dataset.class_names[target_classes[check_k]] in rubbish_items:
                     rubbish_remain_list.append(check_k)
-                if cfg.dataset.class_names[target_classes[check_k]] in vegetation_items:
+                if cfg_custom.dataset.class_names[target_classes[check_k]] in vegetation_items:
                     vegetation_remain_list.append(check_k)
-                if cfg.dataset.class_names[target_classes[check_k]] in person_items:
+                if cfg_custom.dataset.class_names[target_classes[check_k]] in person_items:
                     person_remain_list.append(check_k)
                 check_k += 1
             
@@ -703,7 +705,7 @@ def image_callback(image_data):
                                     # 最大单体目标的面积
                                     region_s[b_area_id[b_pt] - 1, 0] = s_polygon[i, 0]
                                     # 最大单体目标的体积
-                                    v_coef = rubbish_volume_coefficient_list[rubbish_list.index(cfg.dataset.class_names[rubbish_classes[i]])]
+                                    v_coef = rubbish_volume_coefficient_list[rubbish_list.index(cfg_custom.dataset.class_names[rubbish_classes[i]])]
                                     region_v[b_area_id[b_pt] - 1, 0] = s_polygon[i, 0] * v_coef
                                     # 最大单体目标的位置及尺寸
                                     region_p[b_area_id[b_pt] - 1, 0] = min_x
@@ -715,7 +717,7 @@ def image_callback(image_data):
                         for b_pt in range(effective_pt_num):
                             # 排除区域ID无效点(ID=0)
                             if b_area_id[b_pt]:
-                                w_coef = rubbish_weight_coefficient_list[rubbish_list.index(cfg.dataset.class_names[rubbish_classes[i]])]
+                                w_coef = rubbish_weight_coefficient_list[rubbish_list.index(cfg_custom.dataset.class_names[rubbish_classes[i]])]
                                 rubbish_weight = s_polygon[i, 0] * w_coef
                                 region_w[b_area_id[b_pt] - 1, 0] += rubbish_weight / effective_pt_num
                 
@@ -778,7 +780,7 @@ def image_callback(image_data):
                     
                     # 计算植被类型优先级
                     vegetation_list = ['grass', 'shrub', 'flower']
-                    v_type = vegetation_list.index(cfg.dataset.class_names[vegetation_classes[i]]) + 1
+                    v_type = vegetation_list.index(cfg_custom.dataset.class_names[vegetation_classes[i]]) + 1
                     # 更新各区域内植被类型
                     for b_pt in range(effective_pt_num):
                         # 排除区域ID无效点(ID=0)
@@ -904,9 +906,9 @@ if __name__ == '__main__':
     if args.config is None:
         model_path = SavePath.from_str(args.trained_model)
         # TODO: Bad practice? Probably want to do a name lookup instead.
-        args.config = model_path.model_name + '_config'
+        args.config = model_path.model_name + '_config_custom'
         print('Config not specified. Parsed %s from the file name.\n' % args.config)
-        set_cfg(args.config)
+        set_cfg_custom(args.config)
 
     if args.cuda:
         cudnn.fastest = True
@@ -916,7 +918,7 @@ if __name__ == '__main__':
     
     # 加载网络模型
     print('Loading model...')
-    net = Yolact()
+    net = Yolact_custom()
     net.load_weights(args.trained_model)
     net.eval()
     
@@ -924,7 +926,7 @@ if __name__ == '__main__':
         net = net.cuda()
     net.detect.use_fast_nms = args.fast_nms
     net.detect.use_cross_class_nms = args.cross_class_nms
-    cfg.mask_proto_debug = args.mask_proto_debug
+    cfg_custom.mask_proto_debug = args.mask_proto_debug
     print('  Done.')
     
     # 设置相机参数
