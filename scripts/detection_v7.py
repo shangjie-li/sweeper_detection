@@ -50,12 +50,11 @@ import rospy
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
-if seucar_switch:
-    from transmiter.msg import AreaInfo
-    from transmiter.msg import AreasInfo
-    from transmiter.msg import EnvInfo
-    from transmiter.msg import Object
-    from transmiter.msg import Objects
+from transmiter.msg import AreaInfo
+from transmiter.msg import AreasInfo
+from transmiter.msg import EnvInfo
+from transmiter.msg import Object
+from transmiter.msg import Objects
 
 import message_filters
 import numpy as np
@@ -825,46 +824,44 @@ def image_callback(image_data):
         else:
             result_image = frame.byte().cpu().numpy()
     
-    # 以ROS消息输出检测及后处理结果
-    if seucar_switch:
-        # 输出变量areasinfo_msg
-        # 分别添加8个区域的污染等级、植被类型、行人标志、区域ID、最大垃圾体积、区域内总质量
-        areasinfo_msg = AreasInfo()
+    # 输出变量areasinfo_msg
+    # 分别添加8个区域的污染等级、植被类型、行人标志、区域ID、最大垃圾体积、区域内总质量
+    areasinfo_msg = AreasInfo()
+    for region_i in range(8):
+        areainfo_msg = AreaInfo()
+        areainfo_msg.rubbish_grade = int(region_output[region_i, 0])
+        areainfo_msg.vegetation_type = int(region_output[region_i, 1])
+        areainfo_msg.has_person = bool(region_output[region_i, 2])
+        areainfo_msg.area_id = int(region_output[region_i, 3])
+        areainfo_msg.max_volumn = float(region_output[region_i, 4])
+        areainfo_msg.total_weight = float(region_output[region_i, 5])
+        areasinfo_msg.infos.append(areainfo_msg)
+    pub_areasinfo.publish(areasinfo_msg)
+    
+    # 输出变量objects_msg
+    # 若某个区域内存在最大单体目标，且该目标的两个方向的尺寸至少有一个超出极限值，则添加该目标的尺寸和位置信息
+    objects_msg = Objects()
+    objects_msg_flag = False
+    # 确保region_p已经初始化
+    if rubbsih_num > 0:
         for region_i in range(8):
-            areainfo_msg = AreaInfo()
-            areainfo_msg.rubbish_grade = int(region_output[region_i, 0])
-            areainfo_msg.vegetation_type = int(region_output[region_i, 1])
-            areainfo_msg.has_person = bool(region_output[region_i, 2])
-            areainfo_msg.area_id = int(region_output[region_i, 3])
-            areainfo_msg.max_volumn = float(region_output[region_i, 4])
-            areainfo_msg.total_weight = float(region_output[region_i, 5])
-            areasinfo_msg.infos.append(areainfo_msg)
-        pub_areasinfo.publish(areasinfo_msg)
-        
-        # 输出变量objects_msg
-        # 若某个区域内存在最大单体目标，且该目标的两个方向的尺寸至少有一个超出极限值，则添加该目标的尺寸和位置信息
-        objects_msg = Objects()
-        objects_msg_flag = False
-        # 确保region_p已经初始化
-        if rubbsih_num > 0:
-            for region_i in range(8):
-                if region_p[region_i, 2] >= max_width or region_p[region_i, 3] >= max_width:
-                    object_msg = Object()
-                    object_msg.y = - region_p[region_i, 0] + coordinate_offset_y
-                    object_msg.x = region_p[region_i, 1] + coordinate_offset_x
-                    object_msg.h = region_p[region_i, 2]
-                    object_msg.w = region_p[region_i, 3]
-                    objects_msg.objects.append(object_msg)
-                    objects_msg_flag = True
-        if objects_msg_flag:
-            pub_objects.publish(objects_msg)
-        
-        # 输出变量envinfo_msg
-        # 分别添加天气状况、道路类型
-        envinfo_msg = EnvInfo()
-        envinfo_msg.weather = 0
-        envinfo_msg.road_type = 0
-        pub_envinfo.publish(envinfo_msg)
+            if region_p[region_i, 2] >= max_width or region_p[region_i, 3] >= max_width:
+                object_msg = Object()
+                object_msg.y = - region_p[region_i, 0] + coordinate_offset_y
+                object_msg.x = region_p[region_i, 1] + coordinate_offset_x
+                object_msg.h = region_p[region_i, 2]
+                object_msg.w = region_p[region_i, 3]
+                objects_msg.objects.append(object_msg)
+                objects_msg_flag = True
+    if objects_msg_flag:
+        pub_objects.publish(objects_msg)
+    
+    # 输出变量envinfo_msg
+    # 分别添加天气状况、道路类型
+    envinfo_msg = EnvInfo()
+    envinfo_msg.weather = 0
+    envinfo_msg.road_type = 0
+    pub_envinfo.publish(envinfo_msg)
     
     if display_switch or record_switch:
         # 显示区域划分边界线
@@ -876,8 +873,9 @@ def image_callback(image_data):
     if display_switch:
         print('region_output')
         print(region_output)
-        cv2.namedWindow("result_image",0)
+        cv2.namedWindow("raw_image", cv2.WINDOW_NORMAL)
         cv2.imshow("raw_image", cv_image)
+        cv2.namedWindow("result_image", cv2.WINDOW_NORMAL)
         cv2.imshow("result_image", result_image)
         if cv2.waitKey(1) == 27:
             if record_switch and record_initialized:
@@ -961,10 +959,9 @@ if __name__ == '__main__':
     
     # 发布消息队列设为1，订阅消息队列设为1，并保证订阅消息缓冲区足够大
     # 这样可以实现每次订阅最新的节点消息，避免因队列消息拥挤而导致的延迟
-    if seucar_switch:
-        pub_areasinfo = rospy.Publisher(pub_topic_areasinfo, AreasInfo, queue_size=1)
-        pub_objects = rospy.Publisher(pub_topic_objects, Objects, queue_size=1)
-        pub_envinfo = rospy.Publisher(pub_topic_envinfo, EnvInfo, queue_size=1)
+    pub_areasinfo = rospy.Publisher(pub_topic_areasinfo, AreasInfo, queue_size=1)
+    pub_objects = rospy.Publisher(pub_topic_objects, Objects, queue_size=1)
+    pub_envinfo = rospy.Publisher(pub_topic_envinfo, EnvInfo, queue_size=1)
     
     rospy.Subscriber(sub_topic_image, Image, image_callback, queue_size=1, buff_size=52428800)
     

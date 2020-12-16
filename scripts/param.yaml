@@ -1,6 +1,6 @@
 detection:
    display_mode: True
-   record_mode: False
+   record_mode: True
    
    region_l1: 7
    region_l2: 3
