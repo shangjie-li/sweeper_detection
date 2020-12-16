@@ -5,6 +5,12 @@
 修改注释_v1(20201217)：
     1.同时运行2个YOLACT网络，分别检测行人和其他类别的目标
     2.行人的数据集为COCO，路面垃圾、植被的数据集为自定义数据集
+    3.用于检测行人的权重文件为yolact_resnet50_54_800000.pth
+    4.用于检测其他目标的权重文件为yolact_resnet50_20201106_1.pth
+    5.对应COCO数据集的person_score_threshold为0.20
+    6.对应自定义数据集的person_score_threshold为0.99
+    7.在param.yaml中增加部分参数，实现动态设置显示信息
+    8.出于代码简洁度考虑，删除parse_args()函数
 """
 
 # For computer seucar.
@@ -14,9 +20,15 @@ seucar_switch = False
 display_switch = False
 # For set /record_mode dynamically.
 record_switch = False
+
 record_initialized = False
 video_raw = None
 video_result = None
+
+# Dynamically set information to display.
+display_masks = True
+display_bboxes = True
+display_scores = True
 
 import rospy
 from sensor_msgs.msg import Image
@@ -75,104 +87,6 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description='YOLACT COCO Evaluation')
-    
-    # Added by shangjie 20200801.
-    if seucar_switch:
-        parser.add_argument('--trained_model',
-                            default='/home/seucar/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_20201105_1.pth', type=str,
-                            help='Trained state_dict file path to open. If "interrupt", this will open the interrupt file.')
-    else:
-        parser.add_argument('--trained_model',
-                            default='/home/lishangjie/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_20201105_1.pth', type=str,
-                            help='Trained state_dict file path to open. If "interrupt", this will open the interrupt file.')
-    
-    parser.add_argument('--top_k', default=30, type=int,
-                        help='Further restrict the number of predictions to parse')
-    parser.add_argument('--cuda', default=True, type=str2bool,
-                        help='Use cuda to evaulate model')
-    parser.add_argument('--fast_nms', default=True, type=str2bool,
-                        help='Whether to use a faster, but not entirely correct version of NMS.')
-    parser.add_argument('--cross_class_nms', default=False, type=str2bool,
-                        help='Whether compute NMS cross-class or per-class.')
-    parser.add_argument('--display_masks', default=True, type=str2bool,
-                        help='Whether or not to display masks over bounding boxes')
-    parser.add_argument('--display_bboxes', default=True, type=str2bool,
-                        help='Whether or not to display bboxes around masks')
-    parser.add_argument('--display_text', default=True, type=str2bool,
-                        help='Whether or not to display text (class [score])')
-    parser.add_argument('--display_scores', default=True, type=str2bool,
-                        help='Whether or not to display scores in addition to classes')
-    parser.add_argument('--display', dest='display', action='store_true',
-                        help='Display qualitative results instead of quantitative ones.')
-    parser.add_argument('--shuffle', dest='shuffle', action='store_true',
-                        help='Shuffles the images when displaying them. Doesn\'t have much of an effect when display is off though.')
-    parser.add_argument('--ap_data_file', default='results/ap_data.pkl', type=str,
-                        help='In quantitative mode, the file to save detections before calculating mAP.')
-    parser.add_argument('--resume', dest='resume', action='store_true',
-                        help='If display not set, this resumes mAP calculations from the ap_data_file.')
-    parser.add_argument('--max_images', default=-1, type=int,
-                        help='The maximum number of images from the dataset to consider. Use -1 for all.')
-    parser.add_argument('--output_coco_json', dest='output_coco_json', action='store_true',
-                        help='If display is not set, instead of processing IoU values, this just dumps detections into the coco json file.')
-    parser.add_argument('--bbox_det_file', default='results/bbox_detections.json', type=str,
-                        help='The output file for coco bbox results if --coco_results is set.')
-    parser.add_argument('--mask_det_file', default='results/mask_detections.json', type=str,
-                        help='The output file for coco mask results if --coco_results is set.')
-    parser.add_argument('--config', default=None,
-                        help='The config object to use.')
-    parser.add_argument('--output_web_json', dest='output_web_json', action='store_true',
-                        help='If display is not set, instead of processing IoU values, this dumps detections for usage with the detections viewer web thingy.')
-    parser.add_argument('--web_det_path', default='web/dets/', type=str,
-                        help='If output_web_json is set, this is the path to dump detections into.')
-    parser.add_argument('--no_bar', dest='no_bar', action='store_true',
-                        help='Do not output the status bar. This is useful for when piping to a file.')
-    parser.add_argument('--display_lincomb', default=False, type=str2bool,
-                        help='If the config uses lincomb masks, output a visualization of how those masks are created.')
-    parser.add_argument('--benchmark', default=False, dest='benchmark', action='store_true',
-                        help='Equivalent to running display mode but without displaying an image.')
-    parser.add_argument('--no_sort', default=False, dest='no_sort', action='store_true',
-                        help='Do not sort images by hashed image ID.')
-    parser.add_argument('--seed', default=None, type=int,
-                        help='The seed to pass into random.seed. Note: this is only really for the shuffle and does not (I think) affect cuda stuff.')
-    parser.add_argument('--mask_proto_debug', default=False, dest='mask_proto_debug', action='store_true',
-                        help='Outputs stuff for scripts/compute_mask.py.')
-    parser.add_argument('--no_crop', default=False, dest='crop', action='store_false',
-                        help='Do not crop output masks with the predicted bounding box.')
-    parser.add_argument('--image', default=None, type=str,
-                        help='A path to an image to use for display.')
-    parser.add_argument('--images', default=None, type=str,
-                        help='An input folder of images and output folder to save detected images. Should be in the format input->output.')
-    parser.add_argument('--video', default=None, type=str,
-                        help='A path to a video to evaluate on. Passing in a number will use that index webcam.')
-    parser.add_argument('--video_multiframe', default=1, type=int,
-                        help='The number of frames to evaluate in parallel to make videos play at higher fps.')
-    parser.add_argument('--score_threshold', default=0.05, type=float,
-                        help='Detections with a score under this threshold will not be considered. This currently only works in display mode.')
-    parser.add_argument('--dataset', default=None, type=str,
-                        help='If specified, override the dataset specified in the config with this one (example: coco2017_dataset).')
-    parser.add_argument('--detect', default=False, dest='detect', action='store_true',
-                        help='Don\'t evauluate the mask branch at all and only do object detection. This only works for --display and --benchmark.')
-    parser.add_argument('--display_fps', default=False, dest='display_fps', action='store_true',
-                        help='When displaying / saving video, draw the FPS on the frame')
-    parser.add_argument('--emulate_playback', default=False, dest='emulate_playback', action='store_true',
-                        help='When saving a video, emulate the framerate that you\'d get running in real-time mode.')
-
-    parser.set_defaults(no_bar=False, display=False, resume=False, output_coco_json=False, output_web_json=False, shuffle=False,
-                        benchmark=False, no_sort=False, no_hash=False, mask_proto_debug=False, crop=True, detect=False, display_fps=False,
-                        emulate_playback=False)
-
-    global args
-    args = parser.parse_args(argv)
-
-    if args.output_web_json:
-        args.output_coco_json = True
-    
-    if args.seed is not None:
-        random.seed(args.seed)
-
 color_cache = defaultdict(lambda: {})
 
 def get_color(color_idx, on_gpu=None):
@@ -195,7 +109,7 @@ def result_display(img, masks, classes, scores, boxes, num_target):
     # First, draw the masks on the GPU where we can do it really fast
     # Beware: very fast but possibly unintelligible mask-drawing code ahead
     # I wish I had access to OpenGL or Vulkan but alas, I guess Pytorch tensor operations will have to suffice
-    if args.display_masks and cfg_custom.eval_mask_branch and num_target > 0:
+    if display_masks and cfg_custom.eval_mask_branch and num_target > 0:
         # After this, mask is of size [num_dets, h, w, 1]
         masks = masks[:, :, :, None]
 
@@ -232,10 +146,11 @@ def result_display(img, masks, classes, scores, boxes, num_target):
         x1, y1, x2, y2 = boxes[i, :]
         
         # 显示检测结果
+        if display_bboxes:
+            cv2.rectangle(img_numpy, (x1, y1), (x2, y2), color, 1)
         score = scores[i]
-        cv2.rectangle(img_numpy, (x1, y1), (x2, y2), color, 1)
         _class = cfg_custom.dataset.class_names[classes[i]]
-        text_str = '%s: %.2f' % (_class, score) if args.display_scores else _class
+        text_str = '%s: %.2f' % (_class, score) if display_scores else _class
         text_w, text_h = cv2.getTextSize(text_str, font_face, font_scale, font_thickness)[0]
         cv2.rectangle(img_numpy, (x1, y1), (x1 + text_w, y1 - text_h - 4), color, -1)
         # 图像，文字内容，文字左下角所在uv坐标，字体，大小，颜色，字体宽度
@@ -424,6 +339,11 @@ def image_callback(image_data):
     global video_raw
     global video_result
     
+    global display_masks, display_bboxes, display_scores
+    display_masks = rospy.get_param("~display_masks")
+    display_bboxes = rospy.get_param("~display_bboxes")
+    display_scores = rospy.get_param("~display_scores")
+    
     if record_switch and not record_initialized:
         path_raw = 'video_raw.mp4'
         path_result = 'video_result.mp4'
@@ -496,8 +416,8 @@ def image_callback(image_data):
             save = cfg_custom.rescore_bbox
             cfg_custom.rescore_bbox = True
             # 检测结果
-            t = postprocess_custom(preds, w, h, visualize_lincomb = args.display_lincomb,
-                                         crop_masks        = args.crop,
+            t = postprocess_custom(preds, w, h, visualize_lincomb = False,
+                                         crop_masks        = True,
                                          score_threshold   = min_score_threshold)
             cfg_custom.rescore_bbox = save
         with timer.env('Copy'):
@@ -869,16 +789,21 @@ def image_callback(image_data):
     print("totally time cost:", time_end_all - time_start)
 
 if __name__ == '__main__':
-    # YOLACT
-    parse_args()
-    if args.config is None:
-        model_path = SavePath.from_str(args.trained_model)
-        # TODO: Bad practice? Probably want to do a name lookup instead.
-        args.config = model_path.model_name + '_config_custom'
-        print('Config not specified. Parsed %s from the file name.\n' % args.config)
-        set_cfg_custom(args.config)
-
-    if args.cuda:
+    # YOLACT权重文件，绝对路径
+    if seucar_switch:
+        trained_model = '/home/seucar/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_20201106_1.pth'
+    else:
+        trained_model = '/home/lishangjie/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_20201106_1.pth'
+    model_path = SavePath.from_str(trained_model)
+    
+    # YOLACT配置信息
+    yolact_config = model_path.model_name + '_config_custom'
+    print('Config not specified. Parsed %s from the file name.\n' % yolact_config)
+    set_cfg_custom(yolact_config)
+    
+    # CUDA加速模式
+    cuda_mode = True
+    if cuda_mode:
         cudnn.fastest = True
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
     else:
@@ -887,14 +812,14 @@ if __name__ == '__main__':
     # 加载网络模型
     print('Loading model...')
     net = Yolact_custom()
-    net.load_weights(args.trained_model)
+    net.load_weights(trained_model)
     net.eval()
     
-    if args.cuda:
+    if cuda_mode:
         net = net.cuda()
-    net.detect.use_fast_nms = args.fast_nms
-    net.detect.use_cross_class_nms = args.cross_class_nms
-    cfg_custom.mask_proto_debug = args.mask_proto_debug
+    net.detect.use_fast_nms = True
+    net.detect.use_cross_class_nms = False
+    cfg_custom.mask_proto_debug = False
     print('  Done.')
     
     # 设置相机参数
