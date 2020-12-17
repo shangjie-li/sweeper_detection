@@ -818,6 +818,7 @@ def image_callback(image_data):
                                 if loc_area_id and b_pt_v > effective_pt_v:
                                     effective_pt = True
                                     effective_area_id = loc_area_id
+                                    effective_pt_v = b_pt_v
                     
                     # 更新行人所在区域的标志位
                     if effective_pt:
