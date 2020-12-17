@@ -7,4 +7,10 @@ scripts/layers/__pycache__
 scripts/layers/functions/__pycache__
 scripts/layers/modules/__pycache__
 scripts/utils/__pycache__
+scripts/data_coco
+scripts/data_custom
+scripts/layers_coco
+scripts/layers_custom
+scripts/utils_coco
+scripts/utils_custom
 scripts/*.mp4
