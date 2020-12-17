@@ -6,6 +6,19 @@ detection:
    display_bboxes: True
    display_scores: True
    
+   show_s: False
+   show_p: False
+   show_w: False
+   show_output: False
+   show_region: False
+   show_time: False
+   
+   modal_custom: True
+   modal_coco: True
+   
+   target_fps_seucar: 5
+   target_fps_test: 16
+   
    region_l1: 7
    region_l2: 3
    region_l3: 3
