@@ -3,14 +3,14 @@
 
 """
 修改注释_v1(20201217)：
-    1.同时运行2个YOLACT网络，分别检测行人和其他类别的目标
-    2.行人的数据集为COCO，路面垃圾、植被的数据集为自定义数据集
+    1.同时运行两个YOLACT网络，分别检测行人和其他类别的目标
+    2.行人数据集为COCO，路面垃圾、植被数据集为自定义数据集
     3.用于检测行人的权重文件为yolact_resnet50_54_800000.pth
     4.用于检测其他目标的权重文件为yolact_resnet50_20201106_1.pth
-    5.对应COCO数据集的person_score_threshold为0.20
-    6.对应自定义数据集的person_score_threshold为0.99
-    7.在param.yaml中增加部分参数，实现动态设置显示信息
-    8.出于代码简洁度考虑，删除parse_args()函数
+    5.在param.yaml中增加部分参数，实现动态设置显示信息
+    6.出于代码简洁度考虑，删除parse_args()函数
+    7.为统一两个网络的目标类别名称，重新定义classes
+    8.在config.py中max_size改为320，RTX2060S帧率16fps，Xavier帧率5fps
 """
 
 # For computer seucar.
@@ -66,12 +66,18 @@ from collections import OrderedDict
 import matplotlib.pyplot as plt
 
 from data_custom import COLORS
-from yolact_custom import Yolact_custom
-from utils_custom.augmentations_custom import FastBaseTransform_custom
 from utils_custom import timer
 from utils_custom.functions import SavePath
+
+from yolact_custom import Yolact_custom
+from utils_custom.augmentations_custom import FastBaseTransform_custom
 from layers_custom.output_utils_custom import postprocess_custom
 from data_custom import cfg_custom, set_cfg_custom
+
+from yolact_coco import Yolact_coco
+from utils_coco.augmentations_coco import FastBaseTransform_coco
+from layers_coco.output_utils_coco import postprocess_coco
+from data_coco import cfg_coco, set_cfg_coco
 
 if seucar_switch:
     sys.path.append('/home/seucar/wendao/sweeper/region_divide')
@@ -109,7 +115,7 @@ def result_display(img, masks, classes, scores, boxes, num_target):
     # First, draw the masks on the GPU where we can do it really fast
     # Beware: very fast but possibly unintelligible mask-drawing code ahead
     # I wish I had access to OpenGL or Vulkan but alas, I guess Pytorch tensor operations will have to suffice
-    if display_masks and cfg_custom.eval_mask_branch and num_target > 0:
+    if display_masks and num_target > 0:
         # After this, mask is of size [num_dets, h, w, 1]
         masks = masks[:, :, :, None]
 
@@ -149,7 +155,7 @@ def result_display(img, masks, classes, scores, boxes, num_target):
         if display_bboxes:
             cv2.rectangle(img_numpy, (x1, y1), (x2, y2), color, 1)
         score = scores[i]
-        _class = cfg_custom.dataset.class_names[classes[i]]
+        _class = classes[i]
         text_str = '%s: %.2f' % (_class, score) if display_scores else _class
         text_w, text_h = cv2.getTextSize(text_str, font_face, font_scale, font_thickness)[0]
         cv2.rectangle(img_numpy, (x1, y1), (x1 + text_w, y1 - text_h - 4), color, -1)
@@ -348,9 +354,9 @@ def image_callback(image_data):
         path_raw = 'video_raw.mp4'
         path_result = 'video_result.mp4'
         if seucar_switch:
-            target_fps = 10
+            target_fps = 5
         else:
-            target_fps = 30
+            target_fps = 16
         frame_height = cv_image.shape[0]
         frame_width = cv_image.shape[1]
         video_raw = cv2.VideoWriter(path_raw, cv2.VideoWriter_fourcc(*"mp4v"), target_fps, (frame_width, frame_height), True)
@@ -386,18 +392,24 @@ def image_callback(image_data):
     person_num = 0
     
     with torch.no_grad():
-        # 目标检测
+        # 目标检测（网络一）
         frame = torch.from_numpy(cv_image).cuda().float()
-        batch = FastBaseTransform_custom()(frame.unsqueeze(0))
-        preds = net(batch)
+        batch_custom = FastBaseTransform_custom()(frame.unsqueeze(0))
+        preds_custom = net_custom(batch_custom)
+        
+        # 目标检测（网络二）
+        frame = torch.from_numpy(cv_image).cuda().float()
+        batch_coco = FastBaseTransform_coco()(frame.unsqueeze(0))
+        preds_coco = net_coco(batch_coco)
         
         # 针对不同目标类别设置不同top_k
         rubbish_top_k = 20
         vegetation_top_k = 4
         person_top_k = 4
         other_top_k = 2
-        # 总体top_k
-        total_top_k = rubbish_top_k + vegetation_top_k + person_top_k + other_top_k
+        
+        total_top_k_custom = rubbish_top_k + vegetation_top_k + other_top_k
+        total_top_k_coco = person_top_k
         
         # 针对不同目标类别设置不同score_threshold
         rubbish_score_threshold_1 = 0.05
@@ -406,26 +418,70 @@ def image_callback(image_data):
         vegetation_score_threshold = 0.40
         person_score_threshold = 0.20
         other_score_threshold = 0.30
-        # 最低score_threshold
-        min_score_threshold = min([rubbish_score_threshold_1, rubbish_score_threshold_2, rubbish_score_threshold_3, vegetation_score_threshold,
-                                   person_score_threshold, other_score_threshold])
         
-        # 建立每个目标的蒙版target_masks、类别target_classes、置信度target_scores、边界框target_boxes的一一对应关系
+        min_score_threshold_custom = min([rubbish_score_threshold_1, rubbish_score_threshold_2, rubbish_score_threshold_3,
+                                            vegetation_score_threshold, other_score_threshold])
+        min_score_threshold_coco = person_score_threshold
+        
+        # 建立每个目标的掩膜masks、类别classes、置信度scores、边界框boxes的一一对应关系（网络一）
         h, w, _ = frame.shape
         with timer.env('Postprocess_custom'):
             save = cfg_custom.rescore_bbox
             cfg_custom.rescore_bbox = True
             # 检测结果
-            t = postprocess_custom(preds, w, h, visualize_lincomb = False,
-                                         crop_masks        = True,
-                                         score_threshold   = min_score_threshold)
+            t = postprocess_custom(preds_custom, w, h, visualize_lincomb = False, crop_masks = True,
+                                            score_threshold = min_score_threshold_custom)
             cfg_custom.rescore_bbox = save
-        with timer.env('Copy'):
-            idx = t[1].argsort(0, descending=True)[:total_top_k]
-            if cfg_custom.eval_mask_branch:
-                # Masks are drawn on the GPU, so don't copy
-                masks = t[3][idx]
-            classes, scores, boxes = [x[idx].cpu().numpy() for x in t[:3]]
+        with timer.env('Copy_custom'):
+            idx = t[1].argsort(0, descending=True)[:total_top_k_custom]
+            masks_custom = t[3][idx]
+            classes_custom, scores_custom, boxes_custom = [x[idx].cpu().numpy() for x in t[:3]]
+        
+        # 建立每个目标的掩膜masks、类别classes、置信度scores、边界框boxes的一一对应关系（网络二）
+        h, w, _ = frame.shape
+        with timer.env('Postprocess_coco'):
+            save = cfg_coco.rescore_bbox
+            cfg_coco.rescore_bbox = True
+            # 检测结果
+            t = postprocess_coco(preds_coco, w, h, visualize_lincomb = False, crop_masks = True,
+                                            score_threshold = min_score_threshold_coco)
+            cfg_coco.rescore_bbox = save
+        with timer.env('Copy_coco'):
+            idx = t[1].argsort(0, descending=True)[:total_top_k_coco]
+            masks_coco = t[3][idx]
+            classes_coco, scores_coco, boxes_coco = [x[idx].cpu().numpy() for x in t[:3]]
+        
+        # 合并来自两个网络的检测结果
+        if classes_custom.shape[0] and not classes_coco.shape[0]:
+            masks = masks_custom
+            scores = scores_custom
+            boxes = boxes_custom
+            classes = []
+            for i in range(classes_custom.shape[0]):
+                det_name = cfg_custom.dataset.class_names[classes_custom[i]]
+                classes.append(det_name)
+            classes = np.array(classes)
+        elif classes_coco.shape[0] and not classes_custom.shape[0]:
+            masks = masks_coco
+            scores = scores_coco
+            boxes = boxes_coco
+            classes = []
+            for i in range(classes_coco.shape[0]):
+                det_name = cfg_coco.dataset.class_names[classes_coco[i]]
+                classes.append(det_name)
+            classes = np.array(classes)
+        else:
+            masks = torch.cat([masks_custom, masks_coco], dim=0)
+            scores = np.append(scores_custom, scores_coco, axis=0)
+            boxes = np.append(boxes_custom, boxes_coco, axis=0)
+            classes = []
+            for i in range(classes_custom.shape[0]):
+                det_name = cfg_custom.dataset.class_names[classes_custom[i]]
+                classes.append(det_name)
+            for i in range(classes_coco.shape[0]):
+                det_name = cfg_coco.dataset.class_names[classes_coco[i]]
+                classes.append(det_name)
+            classes = np.array(classes)
         
         # 保留的检测类别
         remain_list = []
@@ -442,27 +498,27 @@ def image_callback(image_data):
         num_person = 0
         num_other = 0
         for j in range(classes.shape[0]):
-            if cfg_custom.dataset.class_names[classes[j]] in rubbish_items_1:
+            if classes[j] in rubbish_items_1:
                 if num_rubbish < rubbish_top_k and scores[j] > rubbish_score_threshold_1:
                     remain_list.append(j)
                     num_rubbish += 1
-            elif cfg_custom.dataset.class_names[classes[j]] in rubbish_items_2:
+            elif classes[j] in rubbish_items_2:
                 if num_rubbish < rubbish_top_k and scores[j] > rubbish_score_threshold_2:
                     remain_list.append(j)
                     num_rubbish += 1
-            elif cfg_custom.dataset.class_names[classes[j]] in rubbish_items_3:
+            elif classes[j] in rubbish_items_3:
                 if num_rubbish < rubbish_top_k and scores[j] > rubbish_score_threshold_3:
                     remain_list.append(j)
                     num_rubbish += 1
-            elif cfg_custom.dataset.class_names[classes[j]] in vegetation_items:
+            elif classes[j] in vegetation_items:
                 if num_vegetation < vegetation_top_k and scores[j] > vegetation_score_threshold:
                     remain_list.append(j)
                     num_vegetation += 1
-            elif cfg_custom.dataset.class_names[classes[j]] in person_items:
+            elif classes[j] in person_items:
                 if num_person < person_top_k and scores[j] > person_score_threshold:
                     remain_list.append(j)
                     num_person += 1
-            elif cfg_custom.dataset.class_names[classes[j]] in other_items:
+            elif classes[j] in other_items:
                 if num_other < other_top_k and scores[j] > other_score_threshold:
                     remain_list.append(j)
                     num_other += 1
@@ -492,11 +548,11 @@ def image_callback(image_data):
             vegetation_items = ['grass', 'shrub', 'flower']
             person_items = ['person']
             while check_k < target_classes.shape[0]:
-                if cfg_custom.dataset.class_names[target_classes[check_k]] in rubbish_items:
+                if target_classes[check_k] in rubbish_items:
                     rubbish_remain_list.append(check_k)
-                if cfg_custom.dataset.class_names[target_classes[check_k]] in vegetation_items:
+                if target_classes[check_k] in vegetation_items:
                     vegetation_remain_list.append(check_k)
-                if cfg_custom.dataset.class_names[target_classes[check_k]] in person_items:
+                if target_classes[check_k] in person_items:
                     person_remain_list.append(check_k)
                 check_k += 1
             
@@ -593,7 +649,7 @@ def image_callback(image_data):
                                     # 最大单体目标的面积
                                     region_s[b_area_id[b_pt] - 1, 0] = s_polygon[i, 0]
                                     # 最大单体目标的体积
-                                    v_coef = rubbish_volume_coefficient_list[rubbish_list.index(cfg_custom.dataset.class_names[rubbish_classes[i]])]
+                                    v_coef = rubbish_volume_coefficient_list[rubbish_list.index(rubbish_classes[i])]
                                     region_v[b_area_id[b_pt] - 1, 0] = s_polygon[i, 0] * v_coef
                                     # 最大单体目标的位置及尺寸
                                     region_p[b_area_id[b_pt] - 1, 0] = min_x
@@ -605,7 +661,7 @@ def image_callback(image_data):
                         for b_pt in range(effective_pt_num):
                             # 排除区域ID无效点(ID=0)
                             if b_area_id[b_pt]:
-                                w_coef = rubbish_weight_coefficient_list[rubbish_list.index(cfg_custom.dataset.class_names[rubbish_classes[i]])]
+                                w_coef = rubbish_weight_coefficient_list[rubbish_list.index(rubbish_classes[i])]
                                 rubbish_weight = s_polygon[i, 0] * w_coef
                                 region_w[b_area_id[b_pt] - 1, 0] += rubbish_weight / effective_pt_num
                 
@@ -668,7 +724,7 @@ def image_callback(image_data):
                     
                     # 计算植被类型优先级
                     vegetation_list = ['grass', 'shrub', 'flower']
-                    v_type = vegetation_list.index(cfg_custom.dataset.class_names[vegetation_classes[i]]) + 1
+                    v_type = vegetation_list.index(vegetation_classes[i]) + 1
                     # 更新各区域内植被类型
                     for b_pt in range(effective_pt_num):
                         # 排除区域ID无效点(ID=0)
@@ -789,18 +845,6 @@ def image_callback(image_data):
     print("totally time cost:", time_end_all - time_start)
 
 if __name__ == '__main__':
-    # YOLACT权重文件，绝对路径
-    if seucar_switch:
-        trained_model = '/home/seucar/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_20201106_1.pth'
-    else:
-        trained_model = '/home/lishangjie/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_20201106_1.pth'
-    model_path = SavePath.from_str(trained_model)
-    
-    # YOLACT配置信息
-    yolact_config = model_path.model_name + '_config_custom'
-    print('Config not specified. Parsed %s from the file name.\n' % yolact_config)
-    set_cfg_custom(yolact_config)
-    
     # CUDA加速模式
     cuda_mode = True
     if cuda_mode:
@@ -809,18 +853,47 @@ if __name__ == '__main__':
     else:
         torch.set_default_tensor_type('torch.FloatTensor')
     
+    # YOLACT网络一（用于检测路面垃圾、植被）
+    if seucar_switch:
+        trained_model = '/home/seucar/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_20201106_1.pth'
+    else:
+        trained_model = '/home/lishangjie/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_20201106_1.pth'
+    model_path = SavePath.from_str(trained_model)
+    yolact_config = model_path.model_name + '_config_custom'
+    print('Config not specified. Parsed %s from the file name.\n' % yolact_config)
+    set_cfg_custom(yolact_config)
     # 加载网络模型
-    print('Loading model...')
-    net = Yolact_custom()
-    net.load_weights(trained_model)
-    net.eval()
-    
+    print('Loading the first model...')
+    net_custom = Yolact_custom()
+    net_custom.load_weights(trained_model)
+    net_custom.eval()
     if cuda_mode:
-        net = net.cuda()
-    net.detect.use_fast_nms = True
-    net.detect.use_cross_class_nms = False
+        net_custom = net_custom.cuda()
+    net_custom.detect.use_fast_nms = True
+    net_custom.detect.use_cross_class_nms = False
     cfg_custom.mask_proto_debug = False
-    print('  Done.')
+    print('  Done.\n')
+    
+    # YOLACT网络二（用于检测行人）
+    if seucar_switch:
+        trained_model = '/home/seucar/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_54_800000.pth'
+    else:
+        trained_model = '/home/lishangjie/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/weights/yolact_resnet50_54_800000.pth'
+    model_path = SavePath.from_str(trained_model)
+    yolact_config = model_path.model_name + '_config_coco'
+    print('Config not specified. Parsed %s from the file name.\n' % yolact_config)
+    set_cfg_coco(yolact_config)
+    # 加载网络模型
+    print('Loading the second model...')
+    net_coco = Yolact_coco()
+    net_coco.load_weights(trained_model)
+    net_coco.eval()
+    if cuda_mode:
+        net_coco = net_coco.cuda()
+    net_coco.detect.use_fast_nms = True
+    net_coco.detect.use_cross_class_nms = False
+    cfg_coco.mask_proto_debug = False
+    print('  Done.\n')
     
     # 设置相机参数
     CameraT = RegionDivide()
@@ -832,6 +905,7 @@ if __name__ == '__main__':
             print("loadCameraInfo failed!")
     
     # 初始化detection节点
+    print()
     print('Waiting for node...')
     rospy.init_node("detection")
     

@@ -499,7 +499,7 @@ yolact_resnet50_config_custom = Config_custom({
     #~ 'max_size': 550,
     # Added by shangjie 20200808.
     #~ 'max_size': 240,
-    'max_size': 550,
+    'max_size': 320,
     
     # Training params
     # 'lr_steps': (280000, 600000, 700000, 750000),
