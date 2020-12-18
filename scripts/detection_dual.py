@@ -706,6 +706,11 @@ def image_callback(image_data):
                                 rubbish_weight = s_polygon[i, 0] * w_coef
                                 region_w[b_area_id[b_pt] - 1, 0] += rubbish_weight / effective_pt_num
                 
+                region_s = np.around(region_s, decimals=6)
+                region_v = np.around(region_v, decimals=6)
+                region_p = np.around(region_p, decimals=6)
+                region_w = np.around(region_w, decimals=6)
+                
                 # 界定污染等级
                 for region_i in range(8):
                     if region_w[region_i, 0] > 0 and region_w[region_i, 0] <= 50:
@@ -816,6 +821,8 @@ def image_callback(image_data):
                 # 界定有无行人
                 for region_i in range(8):
                     region_output[region_i, 2] = region_person_type[region_i, 0]
+            
+            region_output = np.around(region_output, decimals=6)
             
         else:
             result_image = frame.byte().cpu().numpy()

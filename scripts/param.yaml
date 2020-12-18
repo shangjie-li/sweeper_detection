@@ -17,7 +17,7 @@ detection:
    modal_coco: True
    
    target_fps_seucar: 5
-   target_fps_test: 16
+   target_fps_test: 15
    
    region_l1: 7
    region_l2: 3
