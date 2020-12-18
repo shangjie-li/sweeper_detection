@@ -11,7 +11,7 @@ detection:
    show_w: True
    show_output: True
    show_region: True
-   show_time: True
+   show_time: False
    
    modal_custom: True
    modal_coco: True
