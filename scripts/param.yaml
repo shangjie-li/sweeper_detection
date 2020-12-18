@@ -6,11 +6,11 @@ detection:
    display_bboxes: True
    display_scores: True
    
-   show_s: False
-   show_p: False
-   show_w: False
-   show_output: False
-   show_region: False
+   show_s: True
+   show_p: True
+   show_w: True
+   show_output: True
+   show_region: True
    show_time: False
    
    modal_custom: True
