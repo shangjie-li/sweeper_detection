@@ -498,7 +498,6 @@ yolact_resnet50_config_coco = Config_coco({
     # Image Size
     #~ 'max_size': 550,
     # Added by shangjie 20200808.
-    #~ 'max_size': 240,
     'max_size': 320,
     
     # Training params
