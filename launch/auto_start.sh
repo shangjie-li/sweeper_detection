@@ -3,7 +3,7 @@
 source /opt/ros/melodic/setup.bash
 source ~/wendao/sweeper/ros_ws/devel/setup.bash
 
-roslaunch ~/wendao/sweeper/ros_ws/src/my_image_publisher/launch/img_publisher.launch camera_id:=/dev/camera_r &
+roslaunch ~/wendao/sweeper/ros_ws/src/my_image_publisher/launch/img_publisher.launch camera_id:=1 &
 sleep 5
 
 roslaunch ~/wendao/sweeper/ros_ws/src/transmiter/launch/transmiter.launch &
