@@ -25,7 +25,7 @@ detection:
    region_l4: 3
    region_l5: 2
    
-   max_width: 0.5
+   max_width: 0.2
    coordinate_offset_x: 0
    coordinate_offset_y: 0
    
