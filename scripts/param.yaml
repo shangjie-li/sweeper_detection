@@ -2,21 +2,22 @@ detection:
    display_mode: True
    record_mode: True
    
-   display_masks: True
+   display_masks: False
    display_bboxes: True
    display_scores: True
+   display_contours: False
    
-   show_s: True
-   show_p: True
-   show_w: True
+   show_s: False
+   show_p: False
+   show_w: False
    show_output: True
    show_region: True
-   show_time: False
+   show_time: True
    
-   modal_custom: True
+   modal_custom: False
    modal_coco: True
    
-   target_fps_seucar: 5
+   target_fps_seucar: 10
    target_fps_test: 15
    
    region_l1: 7

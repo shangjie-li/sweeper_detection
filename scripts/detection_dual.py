@@ -30,6 +30,7 @@ video_result = None
 display_masks = True
 display_bboxes = True
 display_scores = True
+display_contours = True
 
 show_s = True
 show_p = True
@@ -172,7 +173,7 @@ def result_display(img, masks, classes, scores, boxes, num_target):
     
     return img_numpy
 
-def get_boundary(img_numpy, num_target, masks, cpt_num=10):
+def get_boundary(img_numpy, num_target, masks, cpt_num=10, draw_contours=True):
     # boundary_pts是四维数组，第一维代表目标的数量，第二维代表点的数量(有效点数<=cpt_num)，第三维是1，第四维存储uv(无效点坐标u=0,v=0)
     boundary_pts = np.zeros((num_target, cpt_num, 1, 2))
     for i in range(num_target):
@@ -195,11 +196,13 @@ def get_boundary(img_numpy, num_target, masks, cpt_num=10):
                 if p_num > contours_p_num:
                     contours_p_num = p_num
                     p_num_max_index = con_i
-            
             contours_max = contours[p_num_max_index]
-            # cv2.drawContours的输入参数包括image, contours, contourIdx, color, thickness
-            # 参数contourIdx为-1时绘制contours中的所有轮廓
-            cv2.drawContours(img_numpy, contours_max, -1, (255, 255, 255), thickness=1)
+            
+            if draw_contours:
+                # cv2.drawContours的输入参数包括image, contours, contourIdx, color, thickness
+                # 参数contourIdx为-1时绘制contours中的所有轮廓
+                cv2.drawContours(img_numpy, contours_max, -1, (255, 255, 255), thickness=1)
+            
             contours_array = contours_max
             
             # contours_array是三维数组，第一维代表点的数量，第二维是1，第三维存储uv
@@ -210,11 +213,13 @@ def get_boundary(img_numpy, num_target, masks, cpt_num=10):
                     cpts.append(cpt_i * cpt_interval)
             else:
                 cpts = list(range(contours_array.shape[0]))
-            
             contours_cpts = contours_array[cpts, :, :]
-            # cv2.drawContours的输入参数包括image, contours, contourIdx, color, thickness
-            # 参数contourIdx为-1时绘制contours中的所有轮廓
-            cv2.drawContours(img_numpy, contours_cpts, -1, (0, 0, 255), 2)
+            
+            if draw_contours:
+                # cv2.drawContours的输入参数包括image, contours, contourIdx, color, thickness
+                # 参数contourIdx为-1时绘制contours中的所有轮廓
+                cv2.drawContours(img_numpy, contours_cpts, -1, (0, 0, 255), 2)
+            
             for c_cpt in range(contours_cpts.shape[0]):
                 boundary_pts[i, c_cpt, 0, :] = contours_cpts[c_cpt, 0, :]
         
@@ -353,10 +358,11 @@ def image_callback(image_data):
     global video_raw
     global video_result
     
-    global display_masks, display_bboxes, display_scores
+    global display_masks, display_bboxes, display_scores, display_contours
     display_masks = rospy.get_param("~display_masks")
     display_bboxes = rospy.get_param("~display_bboxes")
     display_scores = rospy.get_param("~display_scores")
+    display_contours = rospy.get_param("~display_contours")
     
     global show_s, show_p, show_w, show_output, show_region, show_time
     show_s = rospy.get_param("~show_s")
@@ -367,14 +373,9 @@ def image_callback(image_data):
     show_time = rospy.get_param("~show_time")
     
     if record_switch and not record_initialized:
-        path_raw = 'video_raw.mp4'
-        path_result = 'video_result.mp4'
-        if seucar_switch:
-            target_fps = target_fps_seucar
-        else:
-            target_fps = target_fps_test
         frame_height = cv_image.shape[0]
         frame_width = cv_image.shape[1]
+        
         video_raw = cv2.VideoWriter(path_raw, cv2.VideoWriter_fourcc(*"mp4v"), target_fps, (frame_width, frame_height), True)
         video_result = cv2.VideoWriter(path_result, cv2.VideoWriter_fourcc(*"mp4v"), target_fps, (frame_width, frame_height), True)
         record_initialized = True
@@ -625,7 +626,7 @@ def image_callback(image_data):
                 
                 # 掩膜边界取点
                 # rubbish_boundary_pts是四维数组，第一维代表目标的数量，第二维代表点的数量(有效点数<=cpt_num)，第三维是1，第四维存储uv(无效点坐标u=0,v=0)
-                result_image, rubbish_boundary_pts = get_boundary(result_image, rubbsih_num, rubbish_masks, cpt_num=10)
+                result_image, rubbish_boundary_pts = get_boundary(result_image, rubbsih_num, rubbish_masks, cpt_num=10, draw_contours=display_contours)
                 # s_polygon存储每个垃圾目标在世界坐标系中投影于地面的面积
                 s_polygon = np.zeros((rubbsih_num, 1))
                 
@@ -751,7 +752,7 @@ def image_callback(image_data):
             # 针对植被目标的处理
             if vegetation_num > 0:
                 # 掩膜边界取点
-                result_image, vegetation_boundary_pts = get_boundary(result_image, vegetation_num, vegetation_masks, cpt_num=20)
+                result_image, vegetation_boundary_pts = get_boundary(result_image, vegetation_num, vegetation_masks, cpt_num=20, draw_contours=display_contours)
                 # region_vegetation_type存储各区域内植被类型
                 region_vegetation_type = np.zeros((8, 1))
                 
@@ -788,7 +789,7 @@ def image_callback(image_data):
             # 针对行人目标的处理
             if person_num > 0:
                 # 掩膜边界取点
-                result_image, person_boundary_pts = get_boundary(result_image, person_num, person_masks, cpt_num=20)
+                result_image, person_boundary_pts = get_boundary(result_image, person_num, person_masks, cpt_num=20, draw_contours=display_contours)
                 # region_person_type存储各区域内有无行人
                 region_person_type = np.zeros((8, 1))
                 
@@ -968,6 +969,15 @@ if __name__ == '__main__':
         
         target_fps_seucar = rospy.get_param("~target_fps_seucar")
         target_fps_test = rospy.get_param("~target_fps_test")
+        
+        if seucar_switch:
+            target_fps = target_fps_seucar
+            path_raw = '/home/seucar/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/video_raw.mp4'
+            path_result = '/home/seucar/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/video_result.mp4'
+        else:
+            target_fps = target_fps_test
+            path_raw = '/home/lishangjie/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/video_raw.mp4'
+            path_result = '/home/lishangjie/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/video_result.mp4'
         
         # 设置区域划分参数
         l1 = rospy.get_param("~region_l1")
