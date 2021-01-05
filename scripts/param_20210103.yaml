@@ -1,0 +1,36 @@
+detection:
+   display_mode: True
+   record_mode: True
+   
+   display_masks: False
+   display_bboxes: True
+   display_scores: True
+   display_contours: False
+   
+   show_s: False
+   show_p: False
+   show_w: False
+   show_output: True
+   show_region: True
+   show_time: True
+   
+   modal_custom: False
+   modal_coco: True
+   
+   target_fps_seucar: 10
+   target_fps_test: 15
+   
+   region_l1: 7
+   region_l2: 3
+   region_l3: 3
+   region_l4: 3
+   region_l5: 2
+   
+   max_width: 0.2
+   coordinate_offset_x: 0
+   coordinate_offset_y: 0
+   
+   sub_topic_image: /image_rectified
+   pub_topic_areasinfo: /sweeper/area_info
+   pub_topic_objects: /sweeper/obstacles
+   pub_topic_envinfo: /sweeper/env_info
