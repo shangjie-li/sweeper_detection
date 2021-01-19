@@ -5,15 +5,17 @@
 修改注释_v1(20210115)：
     1.同时订阅单目相机图像话题和双目相机点云话题
     2.实现目标实例掩膜和特征点云的数据融合
-    3.双目相机点云投影可视化
-    4.利用垂直矩形拟合垃圾、行人目标轮廓
-    5.利用多边形拟合植被目标轮廓
-    6.分别存储垃圾、植被、行人目标的掩膜、类别、置信度、边界框
-    7.垃圾目标显示选项：2D/3D边界框、掩膜、类别、置信度
-    8.植被目标显示选项：2D/3D边界框、掩膜、类别、置信度
-    9.行人目标显示选项：2D/3D边界框、掩膜、类别、置信度
-    10.以特征点云对目标进行定位及参数估计
-    11.统计回调函数中获取rosparam变量的时间
+    3.双目相机点云可视化
+    4.将垃圾、行人目标水平面投影轮廓拟合为垂直矩形
+    5.将植被目标水平面投影轮廓拟合为凸包多边形
+    6.以特征点云对目标进行定位及参数估计
+    
+TODO：
+    1.分别存储垃圾、植被、行人目标的掩膜、类别、置信度、边界框
+    2.垃圾目标显示选项：2D/3D边界框、掩膜、类别、置信度
+    3.植被目标显示选项：2D/3D边界框、掩膜、类别、置信度
+    4.行人目标显示选项：2D/3D边界框、掩膜、类别、置信度
+    5.统计回调函数中获取rosparam变量的时间
 """
 
 # For computer seucar.
@@ -359,8 +361,14 @@ def detection(img):
         else:
             return None, None, None, None, 0
             
-def get_boundary(xs, zs):
-    # 目前，以垂直包络矩形作为投影轮廓
+def get_boundingbox(xs, zs):
+    # 功能：以垂直包络矩形作为投影轮廓
+    #
+    # 输入：xs <class 'numpy.ndarray'> 为(n,)维矩阵，代表横坐标
+    #      zs <class 'numpy.ndarray'> 为(n,)维矩阵，代表纵坐标
+    #
+    # 输出：hull <class 'numpy.ndarray'> 为(n,1,2)维矩阵，n为轮廓点数
+    
     min_x = xs.min()
     max_x = xs.max()
     min_z = zs.min()
@@ -371,8 +379,28 @@ def get_boundary(xs, zs):
     p3 = np.array([[max_x, max_z]])
     p4 = np.array([[min_x, max_z]])
     
-    # 水平面投影轮廓，hull为n×1×2维矩阵，n为轮廓点数
+    # 水平面投影轮廓，(n,1,2)维矩阵，n为轮廓点数
     hull = np.array([p1, p2, p3, p4])
+    return hull
+    
+def get_convexhull(xs, zs):
+    # 功能：以凸包作为投影轮廓
+    #
+    # 输入：xs <class 'numpy.ndarray'> 为(n,)维矩阵，代表横坐标
+    #      zs <class 'numpy.ndarray'> 为(n,)维矩阵，代表纵坐标
+    #
+    # 输出：hull <class 'numpy.ndarray'> 为(n,1,2)维矩阵，n为轮廓点数
+    
+    xs = xs * 100
+    zs = zs * 100
+    xs = xs.astype(np.int)
+    zs = zs.astype(np.int)
+    
+    pts = np.array((xs, zs)).T
+    hull = cv2.convexHull(pts)
+    
+    # 水平面投影轮廓，(n,1,2)维矩阵，n为轮廓点数
+    hull = hull / 100.0
     return hull
     
 def fusion(camera_xyz, camera_uv, target_masks, target_classes, target_scores, target_boxes, num_dets_to_consider):
@@ -460,7 +488,7 @@ def fusion(camera_xyz, camera_uv, target_masks, target_classes, target_scores, t
                     pts_xyz = np.array([target_xs, target_ys, target_zs], dtype=np.float32).T
                     
                     # 水平面投影轮廓，hull为n×1×2维矩阵，n为轮廓点数
-                    hull = get_boundary(pts_xyz[:, 0], pts_xyz[:, 2])
+                    hull = get_boundingbox(pts_xyz[:, 0], pts_xyz[:, 2])
                     b_x = hull[:, 0, 0]
                     b_z = hull[:, 0, 1]
                     effective_pt_num = hull.shape[0]
@@ -554,7 +582,7 @@ def fusion(camera_xyz, camera_uv, target_masks, target_classes, target_scores, t
                     pts_xyz = np.array([target_xs, target_ys, target_zs], dtype=np.float32).T
                     
                     # 水平面投影轮廓，hull为n×1×2维矩阵，n为轮廓点数
-                    hull = get_boundary(pts_xyz[:, 0], pts_xyz[:, 2])
+                    hull = get_convexhull(pts_xyz[:, 0], pts_xyz[:, 2])
                     b_x = hull[:, 0, 0]
                     b_z = hull[:, 0, 1]
                     effective_pt_num = hull.shape[0]
@@ -591,7 +619,7 @@ def fusion(camera_xyz, camera_uv, target_masks, target_classes, target_scores, t
                     pts_xyz = np.array([target_xs, target_ys, target_zs], dtype=np.float32).T
                     
                     # 水平面投影轮廓，hull为n×1×2维矩阵，n为轮廓点数
-                    hull = get_boundary(pts_xyz[:, 0], pts_xyz[:, 2])
+                    hull = get_boundingbox(pts_xyz[:, 0], pts_xyz[:, 2])
                     b_x = hull[:, 0, 0]
                     b_z = hull[:, 0, 1]
                     effective_pt_num = hull.shape[0]
