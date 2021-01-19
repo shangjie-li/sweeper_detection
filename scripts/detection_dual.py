@@ -2,20 +2,22 @@
 #!/usr/bin/env python3
 
 """
-修改注释_v1(20201217)：
-    1.同时运行两个YOLACT网络，分别检测行人和其他类别的目标
-    2.行人数据集为COCO，路面垃圾、植被数据集为自定义数据集
-    3.用于检测行人的权重文件为yolact_resnet50_54_800000.pth
-    4.用于检测其他目标的权重文件为yolact_resnet50_20201106_1.pth
-    5.在param.yaml中增加部分参数，实现动态设置显示信息
-    6.出于代码简洁度考虑，删除parse_args()函数
-    7.为统一两个网络的目标类别名称，重新定义classes
-    8.在config.py中max_size改为320，RTX2060S帧率16fps，Xavier帧率5fps
-    9.在param.yaml中增加部分参数，实现网络模态可配置
+修改注释_v1(20210115)：
+    1.同时订阅单目相机图像话题和双目相机点云话题
+    2.实现目标实例掩膜和特征点云的数据融合
+    3.双目相机点云投影可视化
+    4.利用垂直矩形拟合垃圾、行人目标轮廓
+    5.利用多边形拟合植被目标轮廓
+    6.分别存储垃圾、植被、行人目标的掩膜、类别、置信度、边界框
+    7.垃圾目标显示选项：2D/3D边界框、掩膜、类别、置信度
+    8.植被目标显示选项：2D/3D边界框、掩膜、类别、置信度
+    9.行人目标显示选项：2D/3D边界框、掩膜、类别、置信度
+    10.以特征点云对目标进行定位及参数估计
+    11.统计回调函数中获取rosparam变量的时间
 """
 
 # For computer seucar.
-seucar_switch = True
+seucar_switch = False
 
 # For set /display_mode dynamically.
 display_switch = False
@@ -30,7 +32,9 @@ video_result = None
 display_masks = True
 display_bboxes = True
 display_scores = True
+display_contours = True
 
+show_pointcloud = True
 show_s = True
 show_p = True
 show_w = True
@@ -38,8 +42,12 @@ show_output = True
 show_region = True
 show_time = True
 
+print_stamp = True
+print_xx = True
+
 import rospy
 from sensor_msgs.msg import Image
+from sensor_msgs.msg import PointCloud2, PointField, Image
 from std_msgs.msg import String
 
 from transmiter.msg import AreaInfo
@@ -87,26 +95,29 @@ from utils_coco.augmentations_coco import FastBaseTransform_coco
 from layers_coco.output_utils_coco import postprocess_coco
 from data_coco import cfg_coco, set_cfg_coco
 
+from numpy_pc2 import pointcloud2_to_xyz_array
+from calib import Calib
+from locat import Locat
+from jet_color import Jet_Color
+
 if seucar_switch:
     sys.path.append('/home/seucar/wendao/sweeper/region_divide')
 else:
     sys.path.append('/home/lishangjie/wendao/sweeper/region_divide')
 from region_divide import *
 
-def str2bool(v):
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
-    else:
-        raise argparse.ArgumentTypeError('Boolean value expected.')
-
-color_cache = defaultdict(lambda: {})
-
+def pointcloud_display(img, camera_xyz, camera_uv):
+    jc = Jet_Color()
+    depth = np.sqrt(np.square(camera_xyz[:, 0]) + np.square(camera_xyz[:, 1]) + np.square(camera_xyz[:, 2]))
+    for pt in range(0, camera_uv.shape[0]):
+        cv_color = jc.get_jet_color(depth[pt] * jet_color)
+        cv2.circle(img, (int(camera_uv[pt][0]), int(camera_uv[pt][1])), 1, cv_color, thickness=-1)
+    return img
+    
 def get_color(color_idx, on_gpu=None):
     # Quick and dirty lambda for selecting the color for a particular index
     # Also keeps track of a per-gpu color cache for maximum speed
-    global color_cache
+    color_cache = defaultdict(lambda: {})
     
     if on_gpu is not None and color_idx in color_cache[on_gpu]:
         return color_cache[on_gpu][color_idx]
@@ -117,21 +128,22 @@ def get_color(color_idx, on_gpu=None):
             color = torch.Tensor(color).to(on_gpu).float() / 255.
             color_cache[on_gpu][color_idx] = color
         return color
-
+        
 def result_display(img, masks, classes, scores, boxes, num_target):
-    img_gpu = img / 255.0
+    img_gpu = torch.from_numpy(img).cuda().float()
+    img_gpu = img_gpu / 255.0
     # First, draw the masks on the GPU where we can do it really fast
     # Beware: very fast but possibly unintelligible mask-drawing code ahead
     # I wish I had access to OpenGL or Vulkan but alas, I guess Pytorch tensor operations will have to suffice
     if display_masks and num_target > 0:
         # After this, mask is of size [num_dets, h, w, 1]
         masks = masks[:, :, :, None]
-
+        
         # Prepare the RGB images for each mask given their color (size [num_dets, h, w, 1])
         colors = torch.cat([get_color(j, on_gpu=img_gpu.device.index).view(1, 1, 1, 3) for j in range(num_target)], dim=0)
         mask_alpha = 0.45
         masks_color = masks.repeat(1, 1, 1, 3) * colors * mask_alpha
-
+        
         # This is 1 everywhere except for 1-mask_alpha where the mask is
         inv_alph_masks = masks * (-mask_alpha) + 1
         
@@ -143,9 +155,9 @@ def result_display(img, masks, classes, scores, boxes, num_target):
             inv_alph_cumul = inv_alph_masks[:(num_target-1)].cumprod(dim=0)
             masks_color_cumul = masks_color[1:] * inv_alph_cumul
             masks_color_summand += masks_color_cumul.sum(dim=0)
-
+            
         img_gpu = img_gpu * inv_alph_masks.prod(dim=0) + masks_color_summand
-
+        
     # Then draw the stuff that needs to be done on the cpu
     # Note, make sure this is a uint8 tensor or opencv will not anti alias text for whatever reason
     img_numpy = (img_gpu * 255).byte().cpu().numpy()
@@ -169,256 +181,42 @@ def result_display(img, masks, classes, scores, boxes, num_target):
         cv2.rectangle(img_numpy, (x1, y1), (x1 + text_w, y1 - text_h - 4), color, -1)
         # 图像，文字内容，文字左下角所在uv坐标，字体，大小，颜色，字体宽度
         cv2.putText(img_numpy, text_str, (x1, y1 - 3), font_face, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
-    
     return img_numpy
-
-def get_boundary(img_numpy, num_target, masks, cpt_num=10):
-    # boundary_pts是四维数组，第一维代表目标的数量，第二维代表点的数量(有效点数<=cpt_num)，第三维是1，第四维存储uv(无效点坐标u=0,v=0)
-    boundary_pts = np.zeros((num_target, cpt_num, 1, 2))
-    for i in range(num_target):
-        try:
-            binary_image = masks[i, :, :].byte().cpu().numpy()
-            binary_image = binary_image.astype(np.uint8)
-            
-            # contours是list型数据，list中每个元素是一个np.array的数组，存储轮廓点坐标uv，len(contours)即轮廓数量
-            # 参数cv2.CHAIN_APPROX_NONE代表存储所有的轮廓点
-            try:
-                binary_image_back, contours, hierarchy = cv2.findContours(binary_image, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-            except ValueError:
-                contours, hierarchy = cv2.findContours(binary_image, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-            
-            # 寻找最大轮廓
-            contours_p_num = 0
-            p_num_max_index = 0
-            for con_i in range(len(contours)):
-                p_num = contours[con_i].shape[0]
-                if p_num > contours_p_num:
-                    contours_p_num = p_num
-                    p_num_max_index = con_i
-            
-            contours_max = contours[p_num_max_index]
-            # cv2.drawContours的输入参数包括image, contours, contourIdx, color, thickness
-            # 参数contourIdx为-1时绘制contours中的所有轮廓
-            cv2.drawContours(img_numpy, contours_max, -1, (255, 255, 255), thickness=1)
-            contours_array = contours_max
-            
-            # contours_array是三维数组，第一维代表点的数量，第二维是1，第三维存储uv
-            if contours_array.shape[0] > cpt_num:
-                cpt_interval = int(contours_array.shape[0] / cpt_num)
-                cpts = []
-                for cpt_i in range(cpt_num):
-                    cpts.append(cpt_i * cpt_interval)
-            else:
-                cpts = list(range(contours_array.shape[0]))
-            
-            contours_cpts = contours_array[cpts, :, :]
-            # cv2.drawContours的输入参数包括image, contours, contourIdx, color, thickness
-            # 参数contourIdx为-1时绘制contours中的所有轮廓
-            cv2.drawContours(img_numpy, contours_cpts, -1, (0, 0, 255), 2)
-            for c_cpt in range(contours_cpts.shape[0]):
-                boundary_pts[i, c_cpt, 0, :] = contours_cpts[c_cpt, 0, :]
-        
-        except IndexError:
-            pass
     
-    boundary_pts = boundary_pts.astype(np.uint16)
-    return img_numpy, boundary_pts
-
-def s_display(result_image, region_s, font_face = cv2.FONT_HERSHEY_DUPLEX, font_scale = 0.5, font_thickness = 1):
-    offs_x = 0
-    offs_y = 22
-    text_str = 'S:' + str(round(region_s[0, 0].astype(np.float32), 3))
-    text_xy = (max(CameraT.b3[0], 0) + offs_x, CameraT.b3[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'S:' + str(round(region_s[1, 0].astype(np.float32), 3))
-    text_xy = (CameraT.a3[0] + offs_x, CameraT.a3[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'S:' + str(round(region_s[2, 0].astype(np.float32), 3))
-    text_xy = (int((CameraT.a3[0] + CameraT.a4[0]) / 2) + offs_x, CameraT.a3[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'S:' + str(round(region_s[3, 0].astype(np.float32), 3))
-    text_xy = (CameraT.a4[0] + offs_x, CameraT.a4[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'S:' + str(round(region_s[4, 0].astype(np.float32), 3))
-    text_xy = (max(CameraT.b5[0], 0) + offs_x, CameraT.b5[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'S:' + str(round(region_s[5, 0].astype(np.float32), 3))
-    text_xy = (CameraT.a5[0] + offs_x, CameraT.a5[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'S:' + str(round(region_s[6, 0].astype(np.float32), 3))
-    text_xy = (int((CameraT.a5[0] + CameraT.a6[0]) / 2) + offs_x, CameraT.a5[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'S:' + str(round(region_s[7, 0].astype(np.float32), 3))
-    text_xy = (CameraT.a6[0] + offs_x, CameraT.a6[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    return result_image
+def output_display(img, region_output):
+    r = region_output
+    # format格式化函数
+    # {:.0f} 不带小数，{:.2f} 保留两位小数，{:>3} 右对齐且宽度为3，{:<3} 左对齐且宽度为3
+    for i in range(8):
+        out_str = "ID:{:.0f} R:{:.0f} V:{:.0f} P:{:.0f} w:{:>3} s:{:>6} v:{:>6} x:{:>6} z:{:>6} dx:{:>6} dz:{:>6}".format(
+                    r[i, 3], r[i, 0], r[i, 1], r[i, 2], 
+                    int(r[i, 4]), round(r[i, 5], 4), round(r[i, 6], 4), 
+                    round(r[i, 7], 2), round(r[i, 8], 2), round(r[i, 9], 2), round(r[i, 10], 2))
+        cv2.putText(img, out_str, (15, 40 + 12 * i), cv2.FONT_HERSHEY_DUPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA)
+    return img
     
-def p_display(result_image, region_p, font_face = cv2.FONT_HERSHEY_DUPLEX, font_scale = 0.5, font_thickness = 1):
-    offs_x = 0
-    offs_y = 34
-    text_str = str(round(region_p[0, 0], 1)) + ',' + str(round(region_p[0, 1], 1)) + ',' + str(round(region_p[0, 2], 2)) + ',' + str(round(region_p[0, 3], 2))
-    text_xy = (max(CameraT.b3[0], 0) + offs_x, CameraT.b3[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = str(round(region_p[1, 0], 1)) + ',' + str(round(region_p[1, 1], 1)) + ',' + str(round(region_p[1, 2], 2)) + ',' + str(round(region_p[1, 3], 2))
-    text_xy = (CameraT.a3[0] + offs_x, CameraT.a3[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = str(round(region_p[2, 0], 1)) + ',' + str(round(region_p[2, 1], 1)) + ',' + str(round(region_p[2, 2], 2)) + ',' + str(round(region_p[2, 3], 2))
-    text_xy = (int((CameraT.a3[0] + CameraT.a4[0]) / 2) + offs_x, CameraT.a3[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = str(round(region_p[3, 0], 1)) + ',' + str(round(region_p[3, 1], 1)) + ',' + str(round(region_p[3, 2], 2)) + ',' + str(round(region_p[3, 3], 2))
-    text_xy = (CameraT.a4[0] + offs_x, CameraT.a4[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = str(round(region_p[4, 0], 1)) + ',' + str(round(region_p[4, 1], 1)) + ',' + str(round(region_p[4, 2], 2)) + ',' + str(round(region_p[4, 3], 2))
-    text_xy = (max(CameraT.b5[0], 0) + offs_x, CameraT.b5[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = str(round(region_p[5, 0], 1)) + ',' + str(round(region_p[5, 1], 1)) + ',' + str(round(region_p[5, 2], 2)) + ',' + str(round(region_p[5, 3], 2))
-    text_xy = (CameraT.a5[0] + offs_x, CameraT.a5[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = str(round(region_p[6, 0], 1)) + ',' + str(round(region_p[6, 1], 1)) + ',' + str(round(region_p[6, 2], 2)) + ',' + str(round(region_p[6, 3], 2))
-    text_xy = (int((CameraT.a5[0] + CameraT.a6[0]) / 2) + offs_x, CameraT.a5[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = str(round(region_p[7, 0], 1)) + ',' + str(round(region_p[7, 1], 1)) + ',' + str(round(region_p[7, 2], 2)) + ',' + str(round(region_p[7, 3], 2))
-    text_xy = (CameraT.a6[0] + offs_x, CameraT.a6[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    return result_image
-
-def w_display(result_image, region_w, font_face = cv2.FONT_HERSHEY_DUPLEX, font_scale = 0.5, font_thickness = 1):
-    offs_x = 52
-    offs_y = 22
-    text_str = 'W:' + str(region_w[0, 0].astype(np.int16))
-    text_xy = (max(CameraT.b3[0], 0) + offs_x, CameraT.b3[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'W:' + str(region_w[1, 0].astype(np.int16))
-    text_xy = (CameraT.a3[0] + offs_x, CameraT.a3[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'W:' + str(region_w[2, 0].astype(np.int16))
-    text_xy = (int((CameraT.a3[0] + CameraT.a4[0]) / 2) + offs_x, CameraT.a3[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'W:' + str(region_w[3, 0].astype(np.int16))
-    text_xy = (CameraT.a4[0] + offs_x, CameraT.a4[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'W:' + str(region_w[4, 0].astype(np.int16))
-    text_xy = (max(CameraT.b5[0], 0) + offs_x, CameraT.b5[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'W:' + str(region_w[5, 0].astype(np.int16))
-    text_xy = (CameraT.a5[0] + offs_x, CameraT.a5[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'W:' + str(region_w[6, 0].astype(np.int16))
-    text_xy = (int((CameraT.a5[0] + CameraT.a6[0]) / 2) + offs_x, CameraT.a5[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'W:' + str(region_w[7, 0].astype(np.int16))
-    text_xy = (CameraT.a6[0] + offs_x, CameraT.a6[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    return result_image
-
-def output_display(result_image, region_output, font_face = cv2.FONT_HERSHEY_DUPLEX, font_scale = 0.5, font_thickness = 1):
-    offs_x = 0
-    offs_y = 10
-    text_str = 'R:' + str(region_output[0, 0].astype(np.uint8)) + ' P:' + str(region_output[0, 2].astype(np.uint8)) + ' V:' + str(region_output[0, 1].astype(np.uint8))
-    text_xy = (max(CameraT.b3[0], 0) + offs_x, CameraT.b3[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'R:' + str(region_output[1, 0].astype(np.uint8)) + ' P:' + str(region_output[1, 2].astype(np.uint8)) + ' V:' + str(region_output[1, 1].astype(np.uint8))
-    text_xy = (CameraT.a3[0] + offs_x, CameraT.a3[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'R:' + str(region_output[2, 0].astype(np.uint8)) + ' P:' + str(region_output[2, 2].astype(np.uint8)) + ' V:' + str(region_output[2, 1].astype(np.uint8))
-    text_xy = (int((CameraT.a3[0] + CameraT.a4[0]) / 2) + offs_x, CameraT.a3[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'R:' + str(region_output[3, 0].astype(np.uint8)) + ' P:' + str(region_output[3, 2].astype(np.uint8)) + ' V:' + str(region_output[3, 1].astype(np.uint8))
-    text_xy = (CameraT.a4[0] + offs_x, CameraT.a4[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'R:' + str(region_output[4, 0].astype(np.uint8)) + ' P:' + str(region_output[4, 2].astype(np.uint8)) + ' V:' + str(region_output[4, 1].astype(np.uint8))
-    text_xy = (max(CameraT.b5[0], 0) + offs_x, CameraT.b5[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'R:' + str(region_output[5, 0].astype(np.uint8)) + ' P:' + str(region_output[5, 2].astype(np.uint8)) + ' V:' + str(region_output[5, 1].astype(np.uint8))
-    text_xy = (CameraT.a5[0] + offs_x, CameraT.a5[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'R:' + str(region_output[6, 0].astype(np.uint8)) + ' P:' + str(region_output[6, 2].astype(np.uint8)) + ' V:' + str(region_output[6, 1].astype(np.uint8))
-    text_xy = (int((CameraT.a5[0] + CameraT.a6[0]) / 2) + offs_x, CameraT.a5[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    text_str = 'R:' + str(region_output[7, 0].astype(np.uint8)) + ' P:' + str(region_output[7, 2].astype(np.uint8)) + ' V:' + str(region_output[7, 1].astype(np.uint8))
-    text_xy = (CameraT.a6[0] + offs_x, CameraT.a6[1] + offs_y)
-    cv2.putText(result_image, text_str, text_xy, font_face, font_scale, (0, 255, 255), font_thickness, cv2.LINE_AA)
-    return result_image
-
-def image_callback(image_data):
-    time_start = time.time()
-    global cv_image
-    cv_image = np.frombuffer(image_data.data, dtype=np.uint8).reshape(image_data.height, image_data.width, -1)
-    
-    global display_switch
-    display_switch = rospy.get_param("~display_mode")
-    global record_switch
-    record_switch = rospy.get_param("~record_mode")
-    global record_initialized
-    global video_raw
-    global video_result
-    
-    global display_masks, display_bboxes, display_scores
-    display_masks = rospy.get_param("~display_masks")
-    display_bboxes = rospy.get_param("~display_bboxes")
-    display_scores = rospy.get_param("~display_scores")
-    
-    global show_s, show_p, show_w, show_output, show_region, show_time
-    show_s = rospy.get_param("~show_s")
-    show_p = rospy.get_param("~show_p")
-    show_w = rospy.get_param("~show_w")
-    show_output = rospy.get_param("~show_output")
-    show_region = rospy.get_param("~show_region")
-    show_time = rospy.get_param("~show_time")
-    
-    if record_switch and not record_initialized:
-        path_raw = 'video_raw.mp4'
-        path_result = 'video_result.mp4'
-        if seucar_switch:
-            target_fps = target_fps_seucar
-        else:
-            target_fps = target_fps_test
-        frame_height = cv_image.shape[0]
-        frame_width = cv_image.shape[1]
-        video_raw = cv2.VideoWriter(path_raw, cv2.VideoWriter_fourcc(*"mp4v"), target_fps, (frame_width, frame_height), True)
-        video_result = cv2.VideoWriter(path_result, cv2.VideoWriter_fourcc(*"mp4v"), target_fps, (frame_width, frame_height), True)
-        record_initialized = True
-        print("Start recording.")
-    
-    if not display_switch:
-        cv2.destroyAllWindows()
-    
-    if not record_switch and record_initialized:
-        video_raw.release()
-        video_result.release()
-        record_initialized = False
-        print("Save video.")
-    
-    # region_output是8行6列数组，第i行存储第i个区域的信息
-    # 第1列为污染等级(0,1,2,3,4,5,6,7)
-    # 第2列为植被类型(0无,1草,2灌木,3花)
-    # 第3列为行人标志(0无,1有)
-    # 第4列为区域ID(1,2,3,4,5,6,7,8)
-    # 第5列为区域内最大垃圾体积
-    # 第6列为区域内总质量
-    region_output = np.zeros((8, 6))
-    
-    # 区域ID初始化
-    for region_i in range(8):
-        region_output[region_i, 3] = region_i + 1
-    
-    # 初始化变量
-    rubbsih_num = 0
-    vegetation_num = 0
-    person_num = 0
-    
+def detection(img):
     with torch.no_grad():
         # 目标检测（网络一）
         if modal_custom:
-            frame = torch.from_numpy(cv_image).cuda().float()
+            frame = torch.from_numpy(img).cuda().float()
             batch_custom = FastBaseTransform_custom()(frame.unsqueeze(0))
             preds_custom = net_custom(batch_custom)
-        
+            
         # 目标检测（网络二）
         if modal_coco:
-            frame = torch.from_numpy(cv_image).cuda().float()
+            frame = torch.from_numpy(img).cuda().float()
             batch_coco = FastBaseTransform_coco()(frame.unsqueeze(0))
             preds_coco = net_coco(batch_coco)
+            
+        # 保留的检测类别
+        remain_list = []
+        rubbish_items_1 = ['branch', 'leaves', 'metal_bottle', 'paper_box', 'peel']
+        rubbish_items_2 = ['plastic_bag', 'plastic_bottle', 'solid_clod', 'solid_crumb']
+        rubbish_items_3 = ['paper_scraps']
+        vegetation_items = ['grass', 'shrub', 'flower']
+        person_items = ['person']
+        other_items = []
         
         # 针对不同目标类别设置不同top_k
         rubbish_top_k = 20
@@ -452,7 +250,7 @@ def image_callback(image_data):
                 idx = t[1].argsort(0, descending=True)[:total_top_k_custom]
                 masks_custom = t[3][idx]
                 classes_custom, scores_custom, boxes_custom = [x[idx].cpu().numpy() for x in t[:3]]
-        
+                
         if modal_coco:
             total_top_k_coco = person_top_k
             min_score_threshold_coco = person_score_threshold
@@ -470,7 +268,7 @@ def image_callback(image_data):
                 idx = t[1].argsort(0, descending=True)[:total_top_k_coco]
                 masks_coco = t[3][idx]
                 classes_coco, scores_coco, boxes_coco = [x[idx].cpu().numpy() for x in t[:3]]
-        
+                
         # 合并检测结果
         if modal_custom and modal_coco:
             if classes_custom.shape[0] and not classes_coco.shape[0]:
@@ -503,7 +301,7 @@ def image_callback(image_data):
                     det_name = cfg_coco.dataset.class_names[classes_coco[i]]
                     classes.append(det_name)
                 classes = np.array(classes)
-            
+                
         elif modal_custom and not modal_coco:
             masks = masks_custom
             scores = scores_custom
@@ -513,7 +311,7 @@ def image_callback(image_data):
                 det_name = cfg_custom.dataset.class_names[classes_custom[i]]
                 classes.append(det_name)
             classes = np.array(classes)
-        
+            
         elif modal_coco and not modal_custom:
             masks = masks_coco
             scores = scores_coco
@@ -523,16 +321,7 @@ def image_callback(image_data):
                 det_name = cfg_coco.dataset.class_names[classes_coco[i]]
                 classes.append(det_name)
             classes = np.array(classes)
-        
-        # 保留的检测类别
-        remain_list = []
-        rubbish_items_1 = ['branch', 'leaves', 'metal_bottle', 'paper_box', 'peel']
-        rubbish_items_2 = ['plastic_bag', 'plastic_bottle', 'solid_clod', 'solid_crumb']
-        rubbish_items_3 = ['paper_scraps']
-        vegetation_items = ['grass', 'shrub', 'flower']
-        person_items = ['person']
-        other_items = []
-        
+            
         # 按top_k和score_threshold提取检测结果
         num_rubbish = 0
         num_vegetation = 0
@@ -565,268 +354,257 @@ def image_callback(image_data):
                     num_other += 1
         num_dets_to_consider = len(remain_list)
         
-        # 确保处理对象非空
         if num_dets_to_consider > 0:
-            target_masks = masks[remain_list]
-            target_classes = classes[remain_list]
-            target_scores = scores[remain_list]
-            target_boxes = boxes[remain_list]
+            return masks[remain_list], classes[remain_list], scores[remain_list], boxes[remain_list], num_dets_to_consider
+        else:
+            return None, None, None, None, 0
             
-            # 显示检测结果
-            if display_switch or record_switch:
-                result_image = result_display(frame, target_masks, target_classes, target_scores, target_boxes, num_dets_to_consider)
-            else:
-                result_image = frame.byte().cpu().numpy()
+def get_boundary(xs, zs):
+    # 目前，以垂直包络矩形作为投影轮廓
+    min_x = xs.min()
+    max_x = xs.max()
+    min_z = zs.min()
+    max_z = zs.max()
+    
+    p1 = np.array([[min_x, min_z]])
+    p2 = np.array([[max_x, min_z]])
+    p3 = np.array([[max_x, max_z]])
+    p4 = np.array([[min_x, max_z]])
+    
+    # 水平面投影轮廓，hull为n×1×2维矩阵，n为轮廓点数
+    hull = np.array([p1, p2, p3, p4])
+    return hull
+    
+def fusion(camera_xyz, camera_uv, target_masks, target_classes, target_scores, target_boxes, num_dets_to_consider):
+    # region_output是8行11列数组，每一行存储一个区域的信息
+    # 第1列为污染等级(0,1,2,3,4,5,6,7)
+    # 第2列为植被类型(0无,1草,2灌木,3花)
+    # 第3列为行人标志(0无,1有)
+    # 第4列为区域ID(1,2,3,4,5,6,7,8)
+    # 第5列为区域内垃圾总质量(单位g)
+    # 第6列为区域内最大单体垃圾的面积(单位m2)
+    # 第7列为区域内最大单体垃圾的体积(单位m3)
+    # 第8列为区域内最大单体垃圾的左前点x坐标(单位m)
+    # 第9列为区域内最大单体垃圾的左前点z坐标(单位m)
+    # 第10列为区域内最大单体垃圾的x方向长度(单位m)
+    # 第11列为区域内最大单体垃圾的z方向长度(单位m)
+    # 最大单体：水平面投影面积最大
+    region_output = np.zeros((8, 11))
+    
+    # 区域ID初始化
+    for region_i in range(8):
+        region_output[region_i, 3] = region_i + 1
+        
+    # 确保处理对象非空
+    if num_dets_to_consider > 0:
+        # 分别存储垃圾目标、植被目标、行人目标，并进行结果后处理
+        rubbish_remain_list = []
+        vegetation_remain_list = []
+        person_remain_list = []
+        
+        rubbish_items = ['branch', 'ads', 'cigarette_butt', 'firecracker', 'glass bottle',
+            'leaves', 'metal_bottle', 'paper_box', 'paper_scraps', 'peel', 'plastic_bag',
+            'plastic_bottle', 'solid_clod', 'solid_crumb']
+        vegetation_items = ['grass', 'shrub', 'flower']
+        person_items = ['person']
+        
+        check_k = 0
+        while check_k < target_classes.shape[0]:
+            if target_classes[check_k] in rubbish_items:
+                rubbish_remain_list.append(check_k)
+            if target_classes[check_k] in vegetation_items:
+                vegetation_remain_list.append(check_k)
+            if target_classes[check_k] in person_items:
+                person_remain_list.append(check_k)
+            check_k += 1
             
-            # 分别存储垃圾目标、植被目标、行人目标，并进行结果后处理
-            check_k = 0
-            rubbish_remain_list = []
-            vegetation_remain_list = []
-            person_remain_list = []
-            rubbish_items = ['branch', 'ads', 'cigarette_butt', 'firecracker', 'glass bottle',
-                'leaves', 'metal_bottle', 'paper_box', 'paper_scraps', 'peel', 'plastic_bag',
-                'plastic_bottle', 'solid_clod', 'solid_crumb']
-            vegetation_items = ['grass', 'shrub', 'flower']
-            person_items = ['person']
-            while check_k < target_classes.shape[0]:
-                if target_classes[check_k] in rubbish_items:
-                    rubbish_remain_list.append(check_k)
-                if target_classes[check_k] in vegetation_items:
-                    vegetation_remain_list.append(check_k)
-                if target_classes[check_k] in person_items:
-                    person_remain_list.append(check_k)
-                check_k += 1
+        rubbish_masks = target_masks[rubbish_remain_list, :, :]
+        rubbish_classes = target_classes[rubbish_remain_list]
+        
+        vegetation_masks = target_masks[vegetation_remain_list, :, :]
+        vegetation_classes = target_classes[vegetation_remain_list]
+        
+        person_masks = target_masks[person_remain_list, :, :]
+        person_classes = target_classes[person_remain_list]
+        
+        rubbsih_num = len(rubbish_remain_list)
+        vegetation_num = len(vegetation_remain_list)
+        person_num = len(person_remain_list)
+        
+        # 针对垃圾目标的处理
+        if rubbsih_num > 0:
+            # 在CPU上操作掩膜
+            rubbish_masks = rubbish_masks.byte().cpu().numpy()
             
-            rubbish_masks = target_masks[rubbish_remain_list, :, :]
-            rubbish_classes = target_classes[rubbish_remain_list]
-            rubbish_scores = target_scores[rubbish_remain_list]
-            rubbish_boxes = target_boxes[rubbish_remain_list, :]
+            # 为不同垃圾分配质量系数(单位g/m3)
+            rubbish_weight_coefficient_list = [160, 80, 200, 200, 8000,
+                80, 1050, 80, 80, 6000, 80,
+                775, 15750, 4000]
+            assert len(rubbish_weight_coefficient_list) == len(rubbish_items)
             
-            vegetation_masks = target_masks[vegetation_remain_list, :, :]
-            vegetation_classes = target_classes[vegetation_remain_list]
-            vegetation_scores = target_scores[vegetation_remain_list]
-            vegetation_boxes = target_boxes[vegetation_remain_list, :]
-            
-            person_masks = target_masks[person_remain_list, :, :]
-            person_classes = target_classes[person_remain_list]
-            person_scores = target_scores[person_remain_list]
-            person_boxes = target_boxes[person_remain_list, :]
-            
-            rubbsih_num = len(rubbish_remain_list)
-            vegetation_num = len(vegetation_remain_list)
-            person_num = len(person_remain_list)
-            
-            # 针对垃圾目标的处理
-            if rubbsih_num > 0:
-                # 在本算法中，目标的定位和相关属性估计均依赖于掩膜，若检测结果不含掩膜，则无法计算
-                # 对跨区域目标的处理：
-                # 设某目标面积为S、体积为V、质量为M，且该目标为超大目标，若该目标有一半的定位点在a区域，另一半的定位点在b区域
-                # 则Ma=Mb=M/2，Sa=Sb=S，Va=Vb=V
+            # 遍历每个目标
+            for i in range(rubbsih_num):
+                target_xs = []
+                target_ys = []
+                target_zs = []
                 
-                # 掩膜边界取点
-                # rubbish_boundary_pts是四维数组，第一维代表目标的数量，第二维代表点的数量(有效点数<=cpt_num)，第三维是1，第四维存储uv(无效点坐标u=0,v=0)
-                result_image, rubbish_boundary_pts = get_boundary(result_image, rubbsih_num, rubbish_masks, cpt_num=10)
-                # s_polygon存储每个垃圾目标在世界坐标系中投影于地面的面积
-                s_polygon = np.zeros((rubbsih_num, 1))
-                
-                rubbish_list = ['branch', 'ads', 'cigarette_butt', 'firecracker', 'glass bottle',
-                    'leaves', 'metal_bottle', 'paper_box', 'paper_scraps', 'peel', 'plastic_bag',
-                    'plastic_bottle', 'solid_clod', 'solid_crumb']
-                # 为不同垃圾分配体积系数(单位m)
-                rubbish_volume_coefficient_list = [0.01, 0.01, 0.01, 0.01, 0.01,
-                    0.01, 0.01, 0.01, 0.01, 0.01, 0.01,
-                    0.01, 0.01, 0.01]
-                # 为不同垃圾分配质量系数(单位g/m2)，当前，质量的计算不取决于体积，只取决于面积
-                rubbish_weight_coefficient_list = [160, 80, 200, 200, 8000,
-                    80, 1050, 80, 80, 6000, 80,
-                    775, 15750, 4000]
-                
-                # region_s存储各区域内垃圾目标的最大单体面积(单位m2)
-                region_s = np.zeros((8, 1))
-                # region_v存储各区域内垃圾目标的最大单体体积(单位m3)
-                region_v = np.zeros((8, 1))
-                # region_p存储各区域内最大单体目标的位置及尺寸(单位m)，记录目标左前点x坐标、左前点z坐标、x方向长度、z方向长度
-                region_p = np.zeros((8, 4))
-                
-                # region_w存储各区域内垃圾目标的质量的总和(单位g)
-                region_w = np.zeros((8, 1))
-                
-                # 遍历每个目标
-                for i in range(rubbish_boundary_pts.shape[0]):
-                    effective_pt_num = 0
-                    b_x, b_z = [], []
-                    b_area_id = []
-                    # 统计有效点数量，计算每个有效点的世界坐标和所在区域
-                    for b_pt in range(rubbish_boundary_pts.shape[1]):
-                        b_pt_u = rubbish_boundary_pts[i, b_pt, 0, 0]
-                        b_pt_v = rubbish_boundary_pts[i, b_pt, 0, 1]
-                        # 排除像素坐标无效点(u=0,v=0)
-                        if b_pt_u or b_pt_v:
-                            loc_b_pt = p2d_table[b_pt_u, b_pt_v]
-                            # 排除世界坐标无效点(x=0,z=0)
-                            if loc_b_pt[0] or loc_b_pt[1]:
-                                effective_pt_num += 1
-                                b_x.append(loc_b_pt[0])
-                                b_z.append(loc_b_pt[1])
-                                b_area_id.append(CameraT.whatArea(loc_b_pt[0], loc_b_pt[1]))
+                # 提取掩膜中的特征点
+                for pt in range(camera_xyz.shape[0]):
+                    if rubbish_masks[i, int(camera_uv[pt][1]), int(camera_uv[pt][0])]:
+                        target_xs.append(camera_xyz[pt][0])
+                        target_ys.append(camera_xyz[pt][1])
+                        target_zs.append(camera_xyz[pt][2])
+                        
+                # 如果掩膜中包含特征点云
+                if len(target_xs):
+                    pts_xyz = np.array([target_xs, target_ys, target_zs], dtype=np.float32).T
                     
-                    # 如果有效点数不小于3，计算面积和质量
-                    if effective_pt_num >= 3:
-                        # 计算面积
-                        s_sum = 0
-                        for b_pt in range(effective_pt_num):
-                            s_sum += b_x[b_pt]*b_z[(b_pt + 1)%effective_pt_num] - b_z[b_pt]*b_x[(b_pt + 1)%effective_pt_num]
-                        s_polygon[i, 0] = abs(s_sum) / 2
-                        # 计算正交矩形包络轮廓
-                        min_x = min(b_x)
-                        min_z = min(b_z)
-                        length_x = max(b_x) - min(b_x)
-                        length_z = max(b_z) - min(b_z)
-                        # 更新各区域内最大单体目标的面积、体积、位置及尺寸
-                        for b_pt in range(effective_pt_num):
-                            # 排除区域ID无效点(ID=0)
-                            if b_area_id[b_pt]:
-                                if s_polygon[i, 0] > region_s[b_area_id[b_pt] - 1, 0]:
-                                    # 最大单体目标的面积
-                                    region_s[b_area_id[b_pt] - 1, 0] = s_polygon[i, 0]
-                                    # 最大单体目标的体积
-                                    v_coef = rubbish_volume_coefficient_list[rubbish_list.index(rubbish_classes[i])]
-                                    region_v[b_area_id[b_pt] - 1, 0] = s_polygon[i, 0] * v_coef
-                                    # 最大单体目标的位置及尺寸
-                                    region_p[b_area_id[b_pt] - 1, 0] = min_x
-                                    region_p[b_area_id[b_pt] - 1, 1] = min_z
-                                    region_p[b_area_id[b_pt] - 1, 2] = length_x
-                                    region_p[b_area_id[b_pt] - 1, 3] = length_z
-                                        
-                        # 计算目标质量并分配给各区域
-                        for b_pt in range(effective_pt_num):
-                            # 排除区域ID无效点(ID=0)
-                            if b_area_id[b_pt]:
-                                w_coef = rubbish_weight_coefficient_list[rubbish_list.index(rubbish_classes[i])]
-                                rubbish_weight = s_polygon[i, 0] * w_coef
-                                region_w[b_area_id[b_pt] - 1, 0] += rubbish_weight / effective_pt_num
-                
-                region_s = np.around(region_s, decimals=6)
-                region_v = np.around(region_v, decimals=6)
-                region_p = np.around(region_p, decimals=6)
-                region_w = np.around(region_w, decimals=6)
-                
-                # 界定污染等级
-                for region_i in range(8):
-                    if region_w[region_i, 0] > 0 and region_w[region_i, 0] <= 50:
-                        region_output[region_i, 0] = 1
-                    elif region_w[region_i, 0] > 50 and region_w[region_i, 0] <= 100:
-                        region_output[region_i, 0] = 2
-                    elif region_w[region_i, 0] > 100 and region_w[region_i, 0] <= 150:
-                        region_output[region_i, 0] = 3
-                    elif region_w[region_i, 0] > 150 and region_w[region_i, 0] <= 200:
-                        region_output[region_i, 0] = 4
-                    elif region_w[region_i, 0] > 200 and region_w[region_i, 0] <= 250:
-                        region_output[region_i, 0] = 5
-                    elif region_w[region_i, 0] > 250 and region_w[region_i, 0] <= 300:
-                        region_output[region_i, 0] = 6
-                    elif region_w[region_i, 0] > 300:
-                        region_output[region_i, 0] = 7
-                        # 限制各区域输出的最大质量
-                        if region_w[region_i, 0] > 350:
-                            region_w[region_i, 0] = 350
-                
-                # 区域内最大垃圾体积
-                for region_i in range(8):
-                    region_output[region_i, 4] = region_v[region_i, 0]
-                
-                # 区域内总质量
-                for region_i in range(8):
-                    region_output[region_i, 5] = region_w[region_i, 0]
-                
-                # 显示各区域针对垃圾目标的处理结果
-                if display_switch or record_switch:
-                    if show_s:
-                        result_image = s_display(result_image, region_s, font_face = cv2.FONT_HERSHEY_DUPLEX, font_scale = 0.4, font_thickness = 1)
-                    if show_p:
-                        result_image = p_display(result_image, region_p, font_face = cv2.FONT_HERSHEY_DUPLEX, font_scale = 0.4, font_thickness = 1)
-                    if show_w:
-                        result_image = w_display(result_image, region_w, font_face = cv2.FONT_HERSHEY_DUPLEX, font_scale = 0.4, font_thickness = 1)
-            
-            # 针对植被目标的处理
-            if vegetation_num > 0:
-                # 掩膜边界取点
-                result_image, vegetation_boundary_pts = get_boundary(result_image, vegetation_num, vegetation_masks, cpt_num=20)
-                # region_vegetation_type存储各区域内植被类型
-                region_vegetation_type = np.zeros((8, 1))
-                
-                # 遍历每个目标
-                for i in range(vegetation_boundary_pts.shape[0]):
-                    effective_pt_num = 0
-                    b_area_id = []
-                    # 统计有效点数量，计算每个有效点的世界坐标和所在区域
-                    for b_pt in range(vegetation_boundary_pts.shape[1]):
-                        b_pt_u = vegetation_boundary_pts[i, b_pt, 0, 0]
-                        b_pt_v = vegetation_boundary_pts[i, b_pt, 0, 1]
-                        # 排除像素坐标无效点(u=0,v=0)
-                        if b_pt_u or b_pt_v:
-                            loc_b_pt = p2d_table[b_pt_u, b_pt_v]
-                            # 排除世界坐标无效点(x=0,z=0)
-                            if loc_b_pt[0] or loc_b_pt[1]:
-                                effective_pt_num += 1
-                                b_area_id.append(CameraT.whatArea(loc_b_pt[0], loc_b_pt[1]))
+                    # 水平面投影轮廓，hull为n×1×2维矩阵，n为轮廓点数
+                    hull = get_boundary(pts_xyz[:, 0], pts_xyz[:, 2])
+                    b_x = hull[:, 0, 0]
+                    b_z = hull[:, 0, 1]
+                    effective_pt_num = hull.shape[0]
                     
-                    # 计算植被类型优先级
-                    vegetation_list = ['grass', 'shrub', 'flower']
-                    v_type = vegetation_list.index(vegetation_classes[i]) + 1
-                    # 更新各区域内植被类型
+                    # 计算横纵方向尺度
+                    min_x = pts_xyz[:, 0].min()
+                    max_x = pts_xyz[:, 0].max()
+                    min_z = pts_xyz[:, 2].min()
+                    max_z = pts_xyz[:, 2].max()
+                    length_x = max_x - min_x
+                    length_z = max_z - min_z
+                    
+                    # 计算多边形轮廓面积
+                    s_sum = 0
                     for b_pt in range(effective_pt_num):
-                        # 排除区域ID无效点(ID=0)
-                        if b_area_id[b_pt]:
-                            if v_type > region_vegetation_type[b_area_id[b_pt] - 1, 0]:
-                                region_vegetation_type[b_area_id[b_pt] - 1, 0] = v_type
-                
-                # 界定植被类型
-                for region_i in range(8):
-                    region_output[region_i, 1] = region_vegetation_type[region_i, 0]
-            
-            # 针对行人目标的处理
-            if person_num > 0:
-                # 掩膜边界取点
-                result_image, person_boundary_pts = get_boundary(result_image, person_num, person_masks, cpt_num=20)
-                # region_person_type存储各区域内有无行人
-                region_person_type = np.zeros((8, 1))
-                
-                # 遍历每个目标
-                for i in range(person_boundary_pts.shape[0]):
-                    effective_pt = False
-                    effective_area_id = 0
-                    effective_pt_u = 0
-                    effective_pt_v = 0
-                    # 统计有效点数量，计算每个有效点的世界坐标和所在区域
-                    for b_pt in range(person_boundary_pts.shape[1]):
-                        b_pt_u = person_boundary_pts[i, b_pt, 0, 0]
-                        b_pt_v = person_boundary_pts[i, b_pt, 0, 1]
-                        # 排除像素坐标无效点(u=0,v=0)
-                        if b_pt_u or b_pt_v:
-                            loc_b_pt = p2d_table[b_pt_u, b_pt_v]
-                            # 排除世界坐标无效点(x=0,z=0)
-                            if loc_b_pt[0] or loc_b_pt[1]:
-                                loc_area_id = CameraT.whatArea(loc_b_pt[0], loc_b_pt[1])
-                                # 排除区域ID无效点(ID=0)，且只考虑边界点中处于图像最下方的点，即行人所在位置
-                                if loc_area_id and b_pt_v > effective_pt_v:
-                                    effective_pt = True
-                                    effective_area_id = loc_area_id
-                                    effective_pt_v = b_pt_v
+                        s_sum += b_x[b_pt]*b_z[(b_pt + 1)%effective_pt_num] - b_z[b_pt]*b_x[(b_pt + 1)%effective_pt_num]
+                    target_area = abs(s_sum) / 2
                     
-                    # 更新行人所在区域的标志位
-                    if effective_pt:
-                        region_person_type[effective_area_id - 1, 0] = 1
-                
-                # 界定有无行人
-                for region_i in range(8):
-                    region_output[region_i, 2] = region_person_type[region_i, 0]
-            
+                    # 计算体积和质量
+                    min_y = pts_xyz[:, 1].min()
+                    max_y = pts_xyz[:, 1].max()
+                    target_height = abs(max_y - min_y)
+                    target_volume = target_area * target_height
+                    w_coef = rubbish_weight_coefficient_list[rubbish_items.index(rubbish_classes[i])]
+                    target_weight = w_coef * target_volume
+                    
+                    # 利用轮廓点进行目标定位，更新各区域内最大单体目标（水平面投影面积最大）的面积、体积、位置及尺寸
+                    for b_pt in range(effective_pt_num):
+                        region = locat.findregion(b_x[b_pt], b_z[b_pt])
+                        if region > 0 and target_area > region_output[region - 1, 5]:
+                            region_output[region - 1, 5] = target_area
+                            region_output[region - 1, 6] = target_volume
+                            region_output[region - 1, 7] = min_x
+                            region_output[region - 1, 8] = min_z
+                            region_output[region - 1, 9] = length_x
+                            region_output[region - 1, 10] = length_z
+                            
+                    # 利用轮廓点进行目标定位，将质量分配到各区域
+                    for b_pt in range(effective_pt_num):
+                        region = locat.findregion(b_x[b_pt], b_z[b_pt])
+                        if region > 0:
+                            region_output[region - 1, 4] += target_weight / effective_pt_num
+                            
+            # 界定污染等级
+            for region_i in range(8):
+                if region_output[region_i, 4] > 0 and region_output[region_i, 4] <= 50:
+                    region_output[region_i, 0] = 1
+                elif region_output[region_i, 4] > 50 and region_output[region_i, 4] <= 100:
+                    region_output[region_i, 0] = 2
+                elif region_output[region_i, 4] > 100 and region_output[region_i, 4] <= 150:
+                    region_output[region_i, 0] = 3
+                elif region_output[region_i, 4] > 150 and region_output[region_i, 4] <= 200:
+                    region_output[region_i, 0] = 4
+                elif region_output[region_i, 4] > 200 and region_output[region_i, 4] <= 250:
+                    region_output[region_i, 0] = 5
+                elif region_output[region_i, 4] > 250 and region_output[region_i, 4] <= 300:
+                    region_output[region_i, 0] = 6
+                elif region_output[region_i, 4] > 300:
+                    region_output[region_i, 0] = 7
+                    
+            # 限制各区域输出
+            for region_i in range(8):
+                if region_output[region_i, 4] > 350:
+                    region_output[region_i, 4] = 350
             region_output = np.around(region_output, decimals=6)
             
-        else:
-            result_image = frame.byte().cpu().numpy()
-    
+        # 针对植被目标的处理
+        if vegetation_num > 0:
+            # 在CPU上操作掩膜
+            vegetation_masks = vegetation_masks.byte().cpu().numpy()
+            
+            # 为不同植被分配优先级
+            vegetation_priority_list = [0, 1, 2]
+            assert len(vegetation_priority_list) == len(vegetation_items)
+            
+            # 遍历每个目标
+            for i in range(vegetation_num):
+                target_xs = []
+                target_ys = []
+                target_zs = []
+                
+                # 提取掩膜中的特征点
+                for pt in range(camera_xyz.shape[0]):
+                    if vegetation_masks[i, int(camera_uv[pt][1]), int(camera_uv[pt][0])]:
+                        target_xs.append(camera_xyz[pt][0])
+                        target_ys.append(camera_xyz[pt][1])
+                        target_zs.append(camera_xyz[pt][2])
+                        
+                # 如果掩膜中包含特征点云
+                if len(target_xs):
+                    pts_xyz = np.array([target_xs, target_ys, target_zs], dtype=np.float32).T
+                    
+                    # 水平面投影轮廓，hull为n×1×2维矩阵，n为轮廓点数
+                    hull = get_boundary(pts_xyz[:, 0], pts_xyz[:, 2])
+                    b_x = hull[:, 0, 0]
+                    b_z = hull[:, 0, 1]
+                    effective_pt_num = hull.shape[0]
+                    
+                    # 计算优先级
+                    target_priority = vegetation_priority_list[vegetation_items.index(vegetation_classes[i])]
+                    
+                    # 利用轮廓点进行目标定位，更新各区域内植被的优先级
+                    for b_pt in range(effective_pt_num):
+                        region = locat.findregion(b_x[b_pt], b_z[b_pt])
+                        if region > 0 and target_priority > region_output[region - 1, 1]:
+                            region_output[region - 1, 1] = target_priority
+                            
+        # 针对行人目标的处理
+        if person_num > 0:
+            # 在CPU上操作掩膜
+            person_masks = person_masks.byte().cpu().numpy()
+            
+            # 遍历每个目标
+            for i in range(person_num):
+                target_xs = []
+                target_ys = []
+                target_zs = []
+                
+                # 提取掩膜中的特征点
+                for pt in range(camera_xyz.shape[0]):
+                    if person_masks[i, int(camera_uv[pt][1]), int(camera_uv[pt][0])]:
+                        target_xs.append(camera_xyz[pt][0])
+                        target_ys.append(camera_xyz[pt][1])
+                        target_zs.append(camera_xyz[pt][2])
+                        
+                # 如果掩膜中包含特征点云
+                if len(target_xs):
+                    pts_xyz = np.array([target_xs, target_ys, target_zs], dtype=np.float32).T
+                    
+                    # 水平面投影轮廓，hull为n×1×2维矩阵，n为轮廓点数
+                    hull = get_boundary(pts_xyz[:, 0], pts_xyz[:, 2])
+                    b_x = hull[:, 0, 0]
+                    b_z = hull[:, 0, 1]
+                    effective_pt_num = hull.shape[0]
+                    
+                    # 利用轮廓点进行目标定位，更新各区域内行人标志位
+                    for b_pt in range(effective_pt_num):
+                        region = locat.findregion(b_x[b_pt], b_z[b_pt])
+                        if region > 0:
+                            region_output[region - 1, 2] = 1
+                        
+    return region_output
+        
+def convert(region_output):
     # 输出变量areasinfo_msg
     # 分别添加8个区域的污染等级、植被类型、行人标志、区域ID、最大垃圾体积、区域内总质量
     areasinfo_msg = AreasInfo()
@@ -836,8 +614,8 @@ def image_callback(image_data):
         areainfo_msg.vegetation_type = int(region_output[region_i, 1])
         areainfo_msg.has_person = bool(region_output[region_i, 2])
         areainfo_msg.area_id = int(region_output[region_i, 3])
-        areainfo_msg.max_volumn = float(region_output[region_i, 4])
-        areainfo_msg.total_weight = float(region_output[region_i, 5])
+        areainfo_msg.total_weight = float(region_output[region_i, 4])
+        areainfo_msg.max_volumn = float(region_output[region_i, 6])
         areasinfo_msg.infos.append(areainfo_msg)
     pub_areasinfo.publish(areasinfo_msg)
     
@@ -845,20 +623,18 @@ def image_callback(image_data):
     # 若某个区域内存在最大单体目标，且该目标的两个方向的尺寸至少有一个超出极限值，则添加该目标的尺寸和位置信息
     objects_msg = Objects()
     objects_msg_flag = False
-    # 确保region_p已经初始化
-    if rubbsih_num > 0:
-        for region_i in range(8):
-            if region_p[region_i, 2] >= max_width or region_p[region_i, 3] >= max_width:
-                object_msg = Object()
-                object_msg.y = - region_p[region_i, 0] + coordinate_offset_y
-                object_msg.x = region_p[region_i, 1] + coordinate_offset_x
-                object_msg.h = region_p[region_i, 2]
-                object_msg.w = region_p[region_i, 3]
-                objects_msg.objects.append(object_msg)
-                objects_msg_flag = True
+    for region_i in range(8):
+        if region_output[region_i, 7] >= max_width or region_output[region_i, 8] >= max_width:
+            object_msg = Object()
+            object_msg.y = - region_output[region_i, 7] + coordinate_offset_y
+            object_msg.x = region_output[region_i, 8] + coordinate_offset_x
+            object_msg.h = region_output[region_i, 9]
+            object_msg.w = region_output[region_i, 10]
+            objects_msg.objects.append(object_msg)
+            objects_msg_flag = True
     if objects_msg_flag:
         pub_objects.publish(objects_msg)
-    
+        
     # 输出变量envinfo_msg
     # 分别添加天气状况、道路类型
     envinfo_msg = EnvInfo()
@@ -866,24 +642,174 @@ def image_callback(image_data):
     envinfo_msg.road_type = 0
     pub_envinfo.publish(envinfo_msg)
     
-    if display_switch or record_switch:
-        # 显示区域划分边界线
-        if show_region:
-            result_image = CameraT.drawLine(result_image, w=1)
-        # 显示输出结果
-        if show_output:
-            result_image = output_display(result_image, region_output, font_face = cv2.FONT_HERSHEY_DUPLEX, font_scale = 0.4, font_thickness = 1)
-        # 显示系统时间
-        if show_time:
-            cv2.putText(result_image, str(time.time()), (5, 20), cv2.FONT_HERSHEY_DUPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+def image_callback(image):
+    global image_stamp_list
+    global cv_image_list
     
+    image_stamp = image.header.stamp.secs + 0.000000001 * image.header.stamp.nsecs
+    cv_image = np.frombuffer(image.data, dtype=np.uint8).reshape(image.height, image.width, -1)
+    
+    if len(image_stamp_list) < 30:
+        image_stamp_list.append(image_stamp)
+        cv_image_list.append(cv_image)
+    else:
+        image_stamp_list.pop(0)
+        cv_image_list.pop(0)
+        image_stamp_list.append(image_stamp)
+        cv_image_list.append(cv_image)
+        
+def zed_callback(pointcloud):
+    time_start_all = time.time()
+    
+    global image_stamp_list
+    global cv_image_list
+    
+    # 图像与点云消息同步
+    lidar_stamp = pointcloud.header.stamp.secs + 0.000000001 * pointcloud.header.stamp.nsecs
+    et_m = float('inf')
+    id_stamp = 0
+    for t in range(len(image_stamp_list)):
+        et = abs(image_stamp_list[t] - lidar_stamp)
+        if et < et_m:
+            et_m = et
+            id_stamp = t
+    cv_image = cv_image_list[id_stamp]
+    frame_height = cv_image.shape[0]
+    frame_width = cv_image.shape[1]
+    
+    global display_switch
+    display_switch = rospy.get_param("~display_mode")
+    global record_switch
+    record_switch = rospy.get_param("~record_mode")
+    global record_initialized
+    global video_raw
+    global video_result
+    
+    global display_masks, display_bboxes, display_scores, display_contours
+    display_masks = rospy.get_param("~display_masks")
+    display_bboxes = rospy.get_param("~display_bboxes")
+    display_scores = rospy.get_param("~display_scores")
+    display_contours = rospy.get_param("~display_contours")
+    
+    global show_pointcloud, show_s, show_p, show_w, show_output, show_region, show_time
+    show_pointcloud = rospy.get_param("~show_pointcloud")
+    show_s = rospy.get_param("~show_s")
+    show_p = rospy.get_param("~show_p")
+    show_w = rospy.get_param("~show_w")
+    show_output = rospy.get_param("~show_output")
+    show_region = rospy.get_param("~show_region")
+    show_time = rospy.get_param("~show_time")
+    
+    global print_stamp, print_xx
+    print_stamp = rospy.get_param("~print_stamp")
+    print_xx = rospy.get_param("~print_xx")
+    
+    if record_switch and not record_initialized:
+        video_raw = cv2.VideoWriter(path_raw, cv2.VideoWriter_fourcc(*"mp4v"), target_fps, (frame_width, frame_height), True)
+        video_result = cv2.VideoWriter(path_result, cv2.VideoWriter_fourcc(*"mp4v"), target_fps, (frame_width, frame_height), True)
+        record_initialized = True
+        print("Start recording.")
+        
+    if not display_switch:
+        cv2.destroyAllWindows()
+        
+    if not record_switch and record_initialized:
+        video_raw.release()
+        video_result.release()
+        record_initialized = False
+        print("Save video.")
+        
+    # 载入图像
+    current_image = cv_image.copy()
+    
+    # 目标检测
+    time_start = time.time()
+    if modal_custom or modal_coco:
+        target_masks, target_classes, target_scores, target_boxes, num_target = detection(current_image)
+    else:
+        target_masks, target_classes, target_scores, target_boxes = None, None, None, None
+        num_target = 0
+    time_detection = round(time.time() - time_start, 3)
+    
+    # 载入点云
+    pointXYZ = pointcloud2_to_xyz_array(pointcloud, remove_nans=True)
+    if print_xx:
+        print("Input pointcloud of", pointXYZ.shape[0])
+    if limit_mode:
+        alpha = 90 - 0.5 * field_of_view
+        k = math.tan(alpha * math.pi / 180.0)
+        pointXYZ = pointXYZ[np.logical_and((pointXYZ[:, 0] > k * pointXYZ[:, 1]), (pointXYZ[:, 0] > -k * pointXYZ[:, 1]))]
+    if clip_mode:
+        pointXYZ = pointXYZ[np.logical_and((pointXYZ[:, 0] ** 2 + pointXYZ[:, 1] ** 2 > min_distance ** 2), (pointXYZ[:, 0] ** 2 + pointXYZ[:, 1] ** 2 < max_distance ** 2))]
+        pointXYZ = pointXYZ[np.logical_and((pointXYZ[:, 2] > view_lower_limit - sensor_height), (pointXYZ[:, 2] < view_higher_limit - sensor_height))]
+        
+    cloud_xyz = calib.lidar_to_cam.dot(pointXYZ.T).T
+    cloud_uv = calib.lidar_to_img.dot(pointXYZ.T).T
+    cloud_uv = np.true_divide(cloud_uv[:, :2], cloud_uv[:, [-1]])
+    camera_xyz = cloud_xyz[(cloud_uv[:, 0] >= 0) & (cloud_uv[:, 0] < frame_width) & (cloud_uv[:, 1] >= 0) & (cloud_uv[:, 1] < frame_height)]
+    camera_uv = cloud_uv[(cloud_uv[:, 0] >= 0) & (cloud_uv[:, 0] < frame_width) & (cloud_uv[:, 1] >= 0) & (cloud_uv[:, 1] < frame_height)]
+    if print_xx:
+        print("Process pointcloud of", camera_xyz.shape[0])
+        print()
+    
+    # 数据融合及结果统计
+    time_start = time.time()
+    if modal_custom or modal_coco:
+        region_output = fusion(camera_xyz, camera_uv, target_masks, target_classes, target_scores, target_boxes, num_target)
+    else:
+        region_output = None
+    time_fusion = round(time.time() - time_start, 3)
+    
+    # 发布检测结果话题
+    if modal_custom or modal_coco:
+        convert(region_output)
+    else:
+        rospy.logerr("Nothing to be converted!")
+        
+    # 修改图像
+    if display_switch or record_switch:
+        # 添加点云
+        if show_pointcloud:
+            current_image = pointcloud_display(current_image, camera_xyz, camera_uv)
+        # 添加检测结果
+        if num_target > 0:
+            current_image = result_display(current_image, target_masks, target_classes, target_scores, target_boxes, num_target)
+        if num_target > 0:
+            current_image = output_display(current_image, region_output)
+        # 添加系统时间
+        if show_time:
+            cv2.putText(current_image, str(time.time()), (5, 20), cv2.FONT_HERSHEY_DUPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+            
     if display_switch:
-        print('region_output')
-        print(region_output)
+        if print_xx and region_output is not None:
+            # region_output是8行11列数组，每一行存储一个区域的信息
+            # 第1列为污染等级(0,1,2,3,4,5,6,7)
+            # 第2列为植被类型(0无,1草,2灌木,3花)
+            # 第3列为行人标志(0无,1有)
+            # 第4列为区域ID(1,2,3,4,5,6,7,8)
+            # 第5列为区域内垃圾总质量(单位g)
+            # 第6列为区域内最大单体垃圾的面积(单位m2)
+            # 第7列为区域内最大单体垃圾的体积(单位m3)
+            # 第8列为区域内最大单体垃圾的左前点x坐标(单位m)
+            # 第9列为区域内最大单体垃圾的左前点z坐标(单位m)
+            # 第10列为区域内最大单体垃圾的x方向长度(单位m)
+            # 第11列为区域内最大单体垃圾的z方向长度(单位m)
+            # 最大单体：水平面投影面积最大
+            print('region_output')
+            r = region_output
+            # format格式化函数
+            # {:.0f} 不带小数，{:.2f} 保留两位小数，{:>3} 右对齐且宽度为3，{:<3} 左对齐且宽度为3
+            for i in range(8):
+                print("ID:{:.0f} R:{:.0f} V:{:.0f} P:{:.0f} w:{:>3} s:{:>6} v:{:>6} x:{:>6} z:{:>6} dx:{:>6} dz:{:>6}".format(
+                    r[i, 3], r[i, 0], r[i, 1], r[i, 2], 
+                    int(r[i, 4]), round(r[i, 5], 4), round(r[i, 6], 4), 
+                    round(r[i, 7], 2), round(r[i, 8], 2), round(r[i, 9], 2), round(r[i, 10], 2)))
+            print()
+            
         cv2.namedWindow("raw_image", cv2.WINDOW_NORMAL)
         cv2.imshow("raw_image", cv_image)
         cv2.namedWindow("result_image", cv2.WINDOW_NORMAL)
-        cv2.imshow("result_image", result_image)
+        cv2.imshow("result_image", current_image)
         if cv2.waitKey(1) == 27:
             if record_switch and record_initialized:
                 video_raw.release()
@@ -892,14 +818,17 @@ def image_callback(image_data):
             cv2.destroyAllWindows()
             # 按下Esc键停止python程序
             rospy.signal_shutdown("It's over.")
-    
+            
     if record_switch and record_initialized:
         video_raw.write(cv_image)
-        video_result.write(result_image)
-    
+        video_result.write(current_image)
+        
     time_end_all = time.time()
-    print("totally time cost:", time_end_all - time_start)
-
+    if print_stamp:
+        print("totally time cost:", time_end_all - time_start_all)
+        print("------------------------------------------------------------------------------")
+        print()
+    
 if __name__ == '__main__':
     # 初始化detection节点
     rospy.init_node("detection")
@@ -914,7 +843,7 @@ if __name__ == '__main__':
             torch.set_default_tensor_type('torch.cuda.FloatTensor')
         else:
             torch.set_default_tensor_type('torch.FloatTensor')
-        
+            
         # YOLACT网络一（用于检测路面垃圾、植被）
         if modal_custom:
             if seucar_switch:
@@ -935,7 +864,7 @@ if __name__ == '__main__':
             net_custom.detect.use_cross_class_nms = False
             cfg_custom.mask_proto_debug = False
             print('  Done.\n')
-        
+            
         # YOLACT网络二（用于检测行人）
         if modal_coco:
             if seucar_switch:
@@ -956,53 +885,85 @@ if __name__ == '__main__':
             net_coco.detect.use_cross_class_nms = False
             cfg_coco.mask_proto_debug = False
             print('  Done.\n')
-        
-        # 设置相机参数
-        CameraT = RegionDivide()
-        if seucar_switch:
-            if(not CameraT.loadCameraInfo("/home/seucar/wendao/sweeper/region_divide/right.yaml")):
-                print("loadCameraInfo failed!")
-        else:
-            if(not CameraT.loadCameraInfo("/home/lishangjie/wendao/sweeper/region_divide/right.yaml")):
-                print("loadCameraInfo failed!")
-        
-        target_fps_seucar = rospy.get_param("~target_fps_seucar")
-        target_fps_test = rospy.get_param("~target_fps_test")
-        
-        # 设置区域划分参数
-        l1 = rospy.get_param("~region_l1")
-        l2 = rospy.get_param("~region_l2")
-        l3 = rospy.get_param("~region_l3")
-        l4 = rospy.get_param("~region_l4")
-        l5 = rospy.get_param("~region_l5")
-        CameraT.setRegionParams(l1, l2, l3, l4, l5)
-        
-        # p2d_table是三维数组，第一维是u第二维是v，第三维存储世界坐标系xz
-        p2d_table = pixel2disTable(CameraT.size[0], CameraT.size[1], CameraT.height, CameraT.theta, CameraT.fx, CameraT.fy, CameraT.cx, CameraT.cy)
-        cv_image = np.array([])
-        
-        # 获取订阅话题名、发布话题名及其他参数
-        sub_topic_image = rospy.get_param("~sub_topic_image")
-        pub_topic_areasinfo = rospy.get_param("~pub_topic_areasinfo")
-        pub_topic_objects = rospy.get_param("~pub_topic_objects")
-        pub_topic_envinfo = rospy.get_param("~pub_topic_envinfo")
-        
-        max_width = rospy.get_param("~max_width")
-        coordinate_offset_x = rospy.get_param("~coordinate_offset_x")
-        coordinate_offset_y = rospy.get_param("~coordinate_offset_y")
-        
-        # 发布消息队列设为1，订阅消息队列设为1，并保证订阅消息缓冲区足够大
-        # 这样可以实现每次订阅最新的节点消息，避免因队列消息拥挤而导致的延迟
-        pub_areasinfo = rospy.Publisher(pub_topic_areasinfo, AreasInfo, queue_size=1)
-        pub_objects = rospy.Publisher(pub_topic_objects, Objects, queue_size=1)
-        pub_envinfo = rospy.Publisher(pub_topic_envinfo, EnvInfo, queue_size=1)
-        
-        print('\nWaiting for node...')
-        rospy.Subscriber(sub_topic_image, Image, image_callback, queue_size=1, buff_size=52428800)
-        
-        # 与C++的spin不同，rospy.spin()的作用是当节点停止时让python程序退出
-        rospy.spin()
+            
+    # 设置帧率
+    target_fps_seucar = rospy.get_param("~target_fps_seucar")
+    target_fps_test = rospy.get_param("~target_fps_test")
     
+    if seucar_switch:
+        target_fps = target_fps_seucar
+        path_raw = '/home/seucar/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/video_raw.mp4'
+        path_result = '/home/seucar/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/video_result.mp4'
     else:
-        print("Modal not specified. Please set modal.")
-        rospy.signal_shutdown("It's over.")
+        target_fps = target_fps_test
+        path_raw = '/home/lishangjie/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/video_raw.mp4'
+        path_result = '/home/lishangjie/wendao/sweeper/ros_ws/src/sweeper_detection/scripts/video_result.mp4'
+        
+    # 设置区域划分参数
+    locat = Locat()
+    l1 = rospy.get_param("~region_l1")
+    l2 = rospy.get_param("~region_l2")
+    l3 = rospy.get_param("~region_l3")
+    l4 = rospy.get_param("~region_l4")
+    l5 = rospy.get_param("~region_l5")
+    locat.loadlocat(l1, l2, l3, l4, l5)
+    print()
+    
+    max_width = rospy.get_param("~max_width")
+    coordinate_offset_x = rospy.get_param("~coordinate_offset_x")
+    coordinate_offset_y = rospy.get_param("~coordinate_offset_y")
+    
+    # 设置相机参数
+    CameraT = RegionDivide()
+    if seucar_switch:
+        if(not CameraT.loadCameraInfo("/home/seucar/wendao/sweeper/region_divide/right.yaml")):
+            print("loadCameraInfo failed!")
+    else:
+        if(not CameraT.loadCameraInfo("/home/lishangjie/wendao/sweeper/region_divide/right.yaml")):
+            print("loadCameraInfo failed!")
+    CameraT.setRegionParams(l1, l2, l3, l4, l5)
+    print()
+    
+    # 获取订阅话题名、发布话题名及其他参数
+    sub_topic_image = rospy.get_param("~sub_topic_image")
+    sub_topic_zed = rospy.get_param("~sub_topic_zed")
+    
+    pub_topic_areasinfo = rospy.get_param("~pub_topic_areasinfo")
+    pub_topic_objects = rospy.get_param("~pub_topic_objects")
+    pub_topic_envinfo = rospy.get_param("~pub_topic_envinfo")
+    
+    calib = Calib()
+    file_path = rospy.get_param("~calibration_file_path")
+    calib.loadcalib(file_path)
+    print()
+    
+    limit_mode = rospy.get_param("~limit_mode")
+    field_of_view = rospy.get_param("~field_of_view")
+    
+    clip_mode = rospy.get_param("~clip_mode")
+    sensor_height = rospy.get_param("~sensor_height")
+    view_higher_limit = rospy.get_param("~view_higher_limit")
+    view_lower_limit = rospy.get_param("~view_lower_limit")
+    min_distance = rospy.get_param("~min_distance")
+    max_distance = rospy.get_param("~max_distance")
+    
+    jet_color = rospy.get_param("~jet_color")
+    
+    # 发布消息队列设为1，订阅消息队列设为1，并保证订阅消息缓冲区足够大
+    # 这样可以实现每次订阅最新的节点消息，避免因队列消息拥挤而导致的延迟
+    pub_areasinfo = rospy.Publisher(pub_topic_areasinfo, AreasInfo, queue_size=1)
+    pub_objects = rospy.Publisher(pub_topic_objects, Objects, queue_size=1)
+    pub_envinfo = rospy.Publisher(pub_topic_envinfo, EnvInfo, queue_size=1)
+    
+    print('Waiting for node...\n')
+    image_stamp_list = []
+    cv_image_list = []
+    rospy.Subscriber(sub_topic_image, Image, image_callback, queue_size=1, buff_size=52428800)
+    while len(image_stamp_list) < 30:
+        time.sleep(1)
+        
+    rospy.Subscriber(sub_topic_zed, PointCloud2, zed_callback, queue_size=1, buff_size=52428800)
+    
+    # 与C++的spin不同，rospy.spin()的作用是当节点停止时让python程序退出
+    rospy.spin()
+

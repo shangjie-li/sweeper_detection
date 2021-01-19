@@ -5,16 +5,21 @@ detection:
    display_masks: True
    display_bboxes: True
    display_scores: True
+   display_contours: True
    
+   show_pointcloud: True
    show_s: True
    show_p: True
    show_w: True
    show_output: True
    show_region: True
-   show_time: False
+   show_time: True
+   
+   print_stamp: True
+   print_xx: True
    
    modal_custom: True
-   modal_coco: True
+   modal_coco: False
    
    target_fps_seucar: 5
    target_fps_test: 15
@@ -30,6 +35,23 @@ detection:
    coordinate_offset_y: 0
    
    sub_topic_image: /image_rectified
+   sub_topic_zed: /zed/zed_node/point_cloud/cloud_registered
+   
    pub_topic_areasinfo: /sweeper/area_info
    pub_topic_objects: /sweeper/obstacles
    pub_topic_envinfo: /sweeper/env_info
+   
+   calibration_file_path: /home/lishangjie/wendao/sweeper/ros_ws/src/sweeper_detection/conf/head_camera.yaml
+   
+   limit_mode: True
+   field_of_view: 50
+   
+   clip_mode: True
+   sensor_height: 1.75
+   view_higher_limit: 2.0
+   view_lower_limit: -2.0
+   min_distance: 0.5
+   max_distance: 20
+   
+   jet_color: 25
+

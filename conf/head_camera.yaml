@@ -11,7 +11,7 @@ LidarToCameraMat: !!opencv-matrix
    dt: d
    data: [0, -1, 0, 0, 0, 0, -1, 0, 1, 0, 0, 0, 0, 0, 0, 1]
 RotationAngleX: -3
-RotationAngleY: -1.5
+RotationAngleY: -3.5
 RotationAngleZ: 0
 
 
