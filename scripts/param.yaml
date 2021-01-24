@@ -1,20 +1,27 @@
 detection:
    display_mode: True
    record_mode: True
+   realtime_control: True
    
-   display_masks: True
-   display_bboxes: True
-   display_scores: True
-   display_contours: True
-   
+   show_result_r: True
+   box3d_mode_r: True
+   show_mask_r: True
+   show_score_r: True
+
+   show_result_v: True
+   box3d_mode_v: True
+   show_mask_v: True
+   show_score_v: True
+
+   show_result_p: True
+   box3d_mode_p: True
+   show_mask_p: True
+   show_score_p: True
+
    show_pointcloud: True
-   show_s: True
-   show_p: True
-   show_w: True
    show_output: True
-   show_region: True
    show_time: True
-   
+
    print_stamp: True
    print_xx: True
    
