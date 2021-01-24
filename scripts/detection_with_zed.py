@@ -16,10 +16,17 @@
     11.在param.yaml文件中增加若干控制选项
     12.终端显示各部分计算过程的耗时情况
     
+在RTX2060S上测试，计算过程平均耗时(20210124)：
+    time cost of rosparam:    0.010 # 当realtime_control置为False时，该耗时为0.001
+    time cost of detection:   0.020
+    time cost of projection:  0.001
+    time cost of fusion:      0.030
+    time cost of display:     0.040 # 当display_mode和record_mode均置为False时，该耗时为0.000
+    time cost of all:         0.101
+    
 TODO：
     1.使用新的权重文件
-    2.优化数据融合机制，提高运行速度
-    3.增加双目相机点云密度及连续性
+    2.增加双目相机点云密度及连续性
 """
 
 # For computer seucar.
@@ -699,7 +706,7 @@ def get_convexhull(xs, zs):
     
     return hull
     
-def fusion(camera_xyz, camera_uv, target_masks, target_classes, target_scores, target_boxes):
+def fusion(camera_xyz, camera_uv, target_masks, target_classes, target_scores, target_boxes, frame_height, frame_width):
     global region_output
     
     # 分别存储垃圾目标、植被目标、行人目标，并进行结果后处理
@@ -712,6 +719,16 @@ def fusion(camera_xyz, camera_uv, target_masks, target_classes, target_scores, t
         'plastic_bottle', 'solid_clod', 'solid_crumb']
     vegetation_items = ['grass', 'shrub', 'flower']
     person_items = ['person']
+    
+    # 为不同垃圾分配质量系数(单位g/m3)
+    rubbish_weight_coefficient_list = [160, 80, 200, 200, 8000,
+        80, 1050, 80, 80, 6000, 80,
+        775, 15750, 4000]
+    assert len(rubbish_weight_coefficient_list) == len(rubbish_items)
+    
+    # 为不同植被分配优先级
+    vegetation_priority_list = [0, 1, 2]
+    assert len(vegetation_priority_list) == len(vegetation_items)
     
     check_k = 0
     while check_k < target_classes.shape[0]:
@@ -760,35 +777,40 @@ def fusion(camera_xyz, camera_uv, target_masks, target_classes, target_scores, t
     p_heights = []
     p_positions = np.zeros((person_num, 2))
     
+    # 将点云投影为三通道深度图，三通道分别为xyz
+    # xyz_img <class 'numpy.ndarray'> (frame_height, frame_width, 3)
+    xyz_img = np.zeros((frame_height, frame_width, 3))
+    for pt in range(camera_xyz.shape[0]):
+        xyz_img[int(camera_uv[pt, 1]), int(camera_uv[pt, 0])] = camera_xyz[pt, :3]
+    
+    # 利用numpy操作掩膜
+    r_masks_numpy = r_masks.byte().cpu().numpy()
+    v_masks_numpy = v_masks.byte().cpu().numpy()
+    p_masks_numpy = p_masks.byte().cpu().numpy()
+    
     # 针对垃圾目标的处理
     if rubbsih_num > 0:
-        # 在CPU上操作掩膜
-        r_masks_cpu = r_masks.byte().cpu().numpy()
-        
-        # 为不同垃圾分配质量系数(单位g/m3)
-        rubbish_weight_coefficient_list = [160, 80, 200, 200, 8000,
-            80, 1050, 80, 80, 6000, 80,
-            775, 15750, 4000]
-        assert len(rubbish_weight_coefficient_list) == len(rubbish_items)
-        
         # 遍历每个目标
         for i in range(rubbsih_num):
-            target_xs = []
-            target_ys = []
-            target_zs = []
+            # 掩膜中的真值位置索引
+            mask = r_masks_numpy[i]
+            idxs = np.where(mask)
             
-            # 提取掩膜中的特征点
-            mask = r_masks_cpu[i]
-            for pt in range(camera_xyz.shape[0]):
-                if mask[int(camera_uv[pt][1]), int(camera_uv[pt][0])]:
-                    target_xs.append(camera_xyz[pt][0])
-                    target_ys.append(camera_xyz[pt][1])
-                    target_zs.append(camera_xyz[pt][2])
-                    
-            # 如果掩膜中包含特征点云
-            if len(target_xs):
-                pts_xyz = np.array([target_xs, target_ys, target_zs], dtype=np.float32).T
-                
+            # 利用位置索引，提取三通道深度图中的xyz坐标
+            xs_temp = xyz_img[idxs[0], idxs[1], 0]
+            ys_temp = xyz_img[idxs[0], idxs[1], 1]
+            zs_temp = xyz_img[idxs[0], idxs[1], 2]
+            
+            # 滤除无效值(0, 0, 0)
+            xs_arr = xs_temp[np.logical_and(xs_temp[:], zs_temp[:])]
+            ys_arr = ys_temp[np.logical_and(xs_temp[:], zs_temp[:])]
+            zs_arr = zs_temp[np.logical_and(xs_temp[:], zs_temp[:])]
+            
+            # pts_xyz <class 'numpy.ndarray'> (n, 3) n为点云数量 代表(x, y, z)
+            pts_xyz = np.array([xs_arr, ys_arr, zs_arr], dtype=np.float32).T
+            
+            # 如果掩膜中包含点云
+            if pts_xyz.shape[0]:
                 # 水平面投影轮廓 <class 'numpy.ndarray'> (n, 1, 2) n为轮廓点数
                 hull = get_recthull(pts_xyz[:, 0], pts_xyz[:, 2])
                 b_x = hull[:, 0, 0]
@@ -885,31 +907,27 @@ def fusion(camera_xyz, camera_uv, target_masks, target_classes, target_scores, t
         
     # 针对植被目标的处理
     if vegetation_num > 0:
-        # 在CPU上操作掩膜
-        v_masks_cpu = v_masks.byte().cpu().numpy()
-        
-        # 为不同植被分配优先级
-        vegetation_priority_list = [0, 1, 2]
-        assert len(vegetation_priority_list) == len(vegetation_items)
-        
         # 遍历每个目标
         for i in range(vegetation_num):
-            target_xs = []
-            target_ys = []
-            target_zs = []
+            # 掩膜中的真值位置索引
+            mask = v_masks_numpy[i]
+            idxs = np.where(mask)
             
-            # 提取掩膜中的特征点
-            mask = v_masks_cpu[i]
-            for pt in range(camera_xyz.shape[0]):
-                if mask[int(camera_uv[pt][1]), int(camera_uv[pt][0])]:
-                    target_xs.append(camera_xyz[pt][0])
-                    target_ys.append(camera_xyz[pt][1])
-                    target_zs.append(camera_xyz[pt][2])
-                    
-            # 如果掩膜中包含特征点云
-            if len(target_xs):
-                pts_xyz = np.array([target_xs, target_ys, target_zs], dtype=np.float32).T
-                
+            # 利用位置索引，提取三通道深度图中的xyz坐标
+            xs_temp = xyz_img[idxs[0], idxs[1], 0]
+            ys_temp = xyz_img[idxs[0], idxs[1], 1]
+            zs_temp = xyz_img[idxs[0], idxs[1], 2]
+            
+            # 滤除无效值(0, 0, 0)
+            xs_arr = xs_temp[np.logical_and(xs_temp[:], zs_temp[:])]
+            ys_arr = ys_temp[np.logical_and(xs_temp[:], zs_temp[:])]
+            zs_arr = zs_temp[np.logical_and(xs_temp[:], zs_temp[:])]
+            
+            # pts_xyz <class 'numpy.ndarray'> (n, 3) n为点云数量 代表(x, y, z)
+            pts_xyz = np.array([xs_arr, ys_arr, zs_arr], dtype=np.float32).T
+            
+            # 如果掩膜中包含点云
+            if pts_xyz.shape[0]:
                 # 水平面投影轮廓 <class 'numpy.ndarray'> (n, 1, 2) n为轮廓点数
                 hull = get_convexhull(pts_xyz[:, 0], pts_xyz[:, 2])
                 b_x = hull[:, 0, 0]
@@ -953,27 +971,27 @@ def fusion(camera_xyz, camera_uv, target_masks, target_classes, target_scores, t
                 
     # 针对行人目标的处理
     if person_num > 0:
-        # 在CPU上操作掩膜
-        p_masks_cpu = p_masks.byte().cpu().numpy()
-        
         # 遍历每个目标
         for i in range(person_num):
-            target_xs = []
-            target_ys = []
-            target_zs = []
+            # 掩膜中的真值位置索引
+            mask = p_masks_numpy[i]
+            idxs = np.where(mask)
             
-            # 提取掩膜中的特征点
-            mask = p_masks_cpu[i]
-            for pt in range(camera_xyz.shape[0]):
-                if mask[int(camera_uv[pt][1]), int(camera_uv[pt][0])]:
-                    target_xs.append(camera_xyz[pt][0])
-                    target_ys.append(camera_xyz[pt][1])
-                    target_zs.append(camera_xyz[pt][2])
-                    
-            # 如果掩膜中包含特征点云
-            if len(target_xs):
-                pts_xyz = np.array([target_xs, target_ys, target_zs], dtype=np.float32).T
-                
+            # 利用位置索引，提取三通道深度图中的xyz坐标
+            xs_temp = xyz_img[idxs[0], idxs[1], 0]
+            ys_temp = xyz_img[idxs[0], idxs[1], 1]
+            zs_temp = xyz_img[idxs[0], idxs[1], 2]
+            
+            # 滤除无效值(0, 0, 0)
+            xs_arr = xs_temp[np.logical_and(xs_temp[:], zs_temp[:])]
+            ys_arr = ys_temp[np.logical_and(xs_temp[:], zs_temp[:])]
+            zs_arr = zs_temp[np.logical_and(xs_temp[:], zs_temp[:])]
+            
+            # pts_xyz <class 'numpy.ndarray'> (n, 3) n为点云数量 代表(x, y, z)
+            pts_xyz = np.array([xs_arr, ys_arr, zs_arr], dtype=np.float32).T
+            
+            # 如果掩膜中包含点云
+            if pts_xyz.shape[0]:
                 # 水平面投影轮廓 <class 'numpy.ndarray'> (n, 1, 2) n为轮廓点数
                 hull = get_recthull(pts_xyz[:, 0], pts_xyz[:, 2])
                 b_x = hull[:, 0, 0]
@@ -1187,7 +1205,7 @@ def zed_callback(pointcloud):
         r_masks, r_classes, r_scores, r_boxes, r_polygons, r_heights, r_positions,\
          v_masks, v_classes, v_scores, v_boxes, v_polygons, v_heights, v_positions,\
           p_masks, p_classes, p_scores, p_boxes, p_polygons, p_heights, p_positions = fusion(
-                    camera_xyz, camera_uv, target_masks, target_classes, target_scores, target_boxes)
+                    camera_xyz, camera_uv, target_masks, target_classes, target_scores, target_boxes, frame_height, frame_width)
     time_fusion = time.time() - time_now
     
     # 发布检测结果话题
